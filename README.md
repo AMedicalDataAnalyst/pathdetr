@@ -35,6 +35,38 @@ python -m experiments.train_pannuke --train_folds 2 3 --test_fold 1
 | 3 | connective | yellow |
 | 4 | dead | cyan |
 
+## Training Defaults
+
+| Parameter | Value |
+|-----------|-------|
+| Backbone | DINOv3-L (frozen) |
+| mask_upsample_factor | 4 (native 64x64 masks) |
+| mask_loss_resolution | 128 |
+| num_queries | 100 |
+| decoder_layers | 6 |
+| lr_fpn | 5e-4 |
+| lr_decoder | 1e-3 |
+| warmup_epochs | 10 |
+| weight_decay | 1e-2 |
+| batch_size | 32 |
+| optimizer | AdamW |
+| score_threshold | 0.3 |
+| box_loss | CIoU |
+| EMA decay | 0.998 |
+
+## Project Structure
+
+```
+mhc_path/
+  config/         # Class taxonomy, reproducibility
+  data/           # PanNuke dataset, stain & GPU augmentation
+  models/         # Backbone, FPN, decoder, full model
+  training/       # Loss, engine, logger
+  evaluation/     # PQ, mAP, F1-det, diagnostics
+experiments/      # Training scripts
+tests/            # Paired tests for all modules
+```
+
 ## Tests
 
 ```bash
