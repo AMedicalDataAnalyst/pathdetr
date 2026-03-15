@@ -3,7 +3,6 @@
 import pytest
 from mhc_path.config.class_maps import (
     CANONICAL_CLASSES,
-    NUM_CLASSES,
     PANNUKE_SOURCE_NAMES,
     ClassMap,
     get_class_map,
@@ -12,7 +11,7 @@ from mhc_path.config.class_maps import (
 
 
 def test_canonical_classes_count():
-    assert NUM_CLASSES == 5
+    assert len(CANONICAL_CLASSES) == 5
 
 
 def test_canonical_class_names():
@@ -28,13 +27,18 @@ def test_pannuke_identity_mapping():
 
 
 def test_pannuke_remap_label():
+    """Raw channel indices map to correct canonical IDs."""
     cm = pannuke_class_map()
-    for i in range(NUM_CLASSES):
-        assert cm.remap_label(i, PANNUKE_SOURCE_NAMES) == i
+    # Channels 0,1 are identity; 2→3(connective), 3→4(dead), 4→2(epithelial)
+    expected = {0: 0, 1: 1, 2: 3, 3: 4, 4: 2}
+    for ch, canonical in expected.items():
+        assert cm.remap_label(ch, PANNUKE_SOURCE_NAMES) == canonical
 
 
-def test_pannuke_source_names_are_canonical():
-    assert PANNUKE_SOURCE_NAMES == CANONICAL_CLASSES
+def test_pannuke_source_names_channel_order():
+    assert PANNUKE_SOURCE_NAMES == (
+        "neoplastic", "inflammatory", "connective", "dead", "epithelial"
+    )
 
 
 def test_get_class_map_pannuke():
@@ -45,7 +49,7 @@ def test_get_class_map_pannuke():
 
 def test_get_class_map_unsupported():
     with pytest.raises(KeyError, match="Unsupported"):
-        get_class_map("consep")
+        get_class_map("nonexistent_dataset")
 
 
 def test_remap_label_out_of_range():

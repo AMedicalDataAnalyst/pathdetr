@@ -1,8 +1,10 @@
-"""Detection Training Engine.
+"""Step 11: Detection Training Engine.
 
 Training loop for detection + segmentation with Hungarian matching.
-AdamW optimizer with separate FPN and decoder parameter groups.
+AdamW optimizer with per-group learning rates (backbone, FPN, decoder).
 GPU augmentation pipeline runs between DataLoader and forward pass.
+
+Depends on: Steps 2b, 3, 9, 12.
 """
 from __future__ import annotations
 
@@ -31,18 +33,20 @@ class DetectionConfig:
     """Configuration for detection training."""
     epochs: int = 50
     batch_size: int = 8
+    lr_backbone: float = 1e-5
     lr_fpn: float = 1e-4
     lr_decoder: float = 1e-4
     weight_decay: float = 0.01
     clip_grad_norm: float = 1.0
     ema_decay: float = 0.9999
     use_amp: bool = True
+    total_train_steps: int = 1
     output_dir: str = "checkpoints/detection"
     num_workers: int = 0
     log_interval: int = 10
 
 # ---------------------------------------------------------------------------
-# Logger protocol
+# Logger protocol (Step 14 compatible)
 # ---------------------------------------------------------------------------
 
 @runtime_checkable
@@ -87,19 +91,26 @@ class _EMAModel:
 def _build_param_groups(
     model: nn.Module, config: DetectionConfig,
 ) -> list[dict[str, Any]]:
-    """Split trainable params into FPN and decoder groups."""
+    """Split params into AdamW groups with per-component learning rates."""
+    backbone: list[nn.Parameter] = []
     fpn: list[nn.Parameter] = []
     decoder: list[nn.Parameter] = []
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "fpn" in name.lower():
+        lo = name.lower()
+        if "backbone" in lo:
+            backbone.append(p)
+        elif "fpn" in lo:
             fpn.append(p)
         else:
             decoder.append(p)
 
     groups: list[dict[str, Any]] = []
+    if backbone:
+        groups.append({"params": backbone, "lr": config.lr_backbone,
+                       "weight_decay": config.weight_decay})
     if fpn:
         groups.append({"params": fpn, "lr": config.lr_fpn,
                        "weight_decay": config.weight_decay})
@@ -134,7 +145,8 @@ class DetectionEngine:
             self.criterion = DetectionLoss(num_classes=nc, matcher=HungarianMatcher())
 
         self.metrics = metrics
-        self.optimizer = self._build_optimizer()
+        self.optimizer: Optional[torch.optim.AdamW] = None
+        self._build_optimizer()
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
         self.ema = _EMAModel(model, decay=config.ema_decay)
 
@@ -158,11 +170,16 @@ class DetectionEngine:
             return model.num_classes
         return 5
 
-    def _build_optimizer(self) -> torch.optim.AdamW:
+    def _build_optimizer(self) -> None:
         groups = _build_param_groups(self.model, self.config)
-        return torch.optim.AdamW(
-            groups, lr=self.config.lr_decoder,
-            weight_decay=self.config.weight_decay)
+        if groups:
+            self.optimizer = torch.optim.AdamW(
+                groups, lr=self.config.lr_decoder,
+                weight_decay=self.config.weight_decay)
+
+    def _zero_grad(self) -> None:
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
 
     def _clip_gradients(self) -> float:
         """Clip gradients by norm; records post-clipping norm."""
@@ -170,18 +187,18 @@ class DetectionEngine:
         if not params:
             return 0.0
         if self.config.use_amp:
-            self.scaler.unscale_(self.optimizer)
+            if self.optimizer is not None:
+                self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(params, self.config.clip_grad_norm)
         post_norm = torch.cat([p.grad.flatten() for p in params]).norm().item()
         self.grad_norms.append(post_norm)
         return post_norm
 
     def _optimizer_step(self) -> None:
+        if self.optimizer is not None:
+            self.scaler.step(self.optimizer) if self.config.use_amp else self.optimizer.step()
         if self.config.use_amp:
-            self.scaler.step(self.optimizer)
             self.scaler.update()
-        else:
-            self.optimizer.step()
 
     def _batch_to_targets(self, batch: dict[str, Any]) -> list[DetectionTarget]:
         boxes, labels = batch["boxes"], batch["labels"]
@@ -189,6 +206,8 @@ class DetectionEngine:
         masks = batch.get("masks")
         targets: list[DetectionTarget] = []
 
+        # boxes can be a padded (B, N_max, 4) tensor or a list of (N_i, 4)
+        # tensors (after GPU augmentation transforms boxes per-image).
         if isinstance(boxes, (list, tuple)):
             for i, box_t in enumerate(boxes):
                 n = num_obj[i].item()
@@ -220,6 +239,9 @@ class DetectionEngine:
             out["pred_masks"] = raw["pred_masks"]
         elif "mask_logits" in raw:
             out["pred_masks"] = raw["mask_logits"]
+        if "hv_maps" in raw:
+            out["pred_hv_maps"] = raw["hv_maps"]
+        # Pass through auxiliary outputs for intermediate-layer losses
         if "aux_outputs" in raw:
             out["aux_outputs"] = raw["aux_outputs"]
         return out
@@ -238,7 +260,7 @@ class DetectionEngine:
                 batch = self.gpu_aug(batch)
 
             targets = self._batch_to_targets(batch)
-            self.optimizer.zero_grad(set_to_none=True)
+            self._zero_grad()
 
             amp_dev = "cuda" if self.device.type == "cuda" else "cpu"
             with torch.amp.autocast(amp_dev, enabled=self.config.use_amp):
@@ -328,7 +350,7 @@ class DetectionEngine:
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "ema_state_dict": self.ema.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+            "optimizer": self.optimizer.state_dict() if self.optimizer else None,
             "config": self.config,
         }, str(path))
         logger.info("Saved checkpoint to %s", path)

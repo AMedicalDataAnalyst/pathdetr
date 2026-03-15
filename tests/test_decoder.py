@@ -66,7 +66,7 @@ def test_segmentation_head_output_shape():
     head = SegmentationHead(d_model=64, pixel_dim=32, upsample_factor=1)
     queries = torch.randn(2, 10, 64)
     pixels = torch.randn(2, 64, 8, 8)
-    masks = head(queries, pixels)
+    masks, _ = head(queries, pixels)
     assert masks.shape == (2, 10, 8, 8)
 
 
@@ -74,7 +74,7 @@ def test_segmentation_head_upsample():
     head = SegmentationHead(d_model=64, pixel_dim=32, upsample_factor=4)
     queries = torch.randn(2, 10, 64)
     pixels = torch.randn(2, 64, 8, 8)
-    masks = head(queries, pixels)
+    masks, _ = head(queries, pixels)
     assert masks.shape == (2, 10, 32, 32)
 
 

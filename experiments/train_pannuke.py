@@ -2,14 +2,14 @@
 
 Supports the official PanNuke 3-fold cross-validation protocol: train on two
 folds, validate on a held-out portion, and test on the third fold.  Repeat for
-all three fold rotations and aggregate.
+all three fold rotations and aggregate with ``aggregate_pannuke_cv.py``.
 
-Config derived from 5-factor factorial results:
-  Frozen DINOv3-L, AdamW for FPN+decoder, StainAug+geometric
-  CIoU box loss, num_queries=100
+Config derived from factorial experiment results:
+  ON:  StainAug, geometric aug, AdamW for FPN+decoder
+  GIoU box loss, BCE+Dice mask loss
   200 epochs, batch_size=32, validate every 10 epochs + at {1, 5}
   lr_fpn=5e-4, lr_decoder=1e-3, cosine LR with 10-epoch warmup
-  clip_grad_norm=1.0, EMA decay=0.998
+  clip_grad_norm=1.0, EMA decay=0.998, num_queries=100
 
 Usage (3-fold CV — recommended):
   python -m experiments.train_pannuke --train_folds 1 2 --test_fold 3
@@ -196,8 +196,13 @@ def _cosine_lr_with_warmup(epoch: int, warmup: int, total: int) -> float:
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+
 def _grad_norms_by_group(model: torch.nn.Module) -> dict[str, float]:
-    norms: dict[str, float] = {"fpn": 0.0, "decoder": 0.0}
+    norms: dict[str, float] = {"fpn": 0.0, "decoder": 0.0, "backbone": 0.0}
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
@@ -205,6 +210,8 @@ def _grad_norms_by_group(model: torch.nn.Module) -> dict[str, float]:
         lo = name.lower()
         if "fpn" in lo:
             norms["fpn"] = max(norms["fpn"], n)
+        elif "backbone" in lo:
+            norms["backbone"] = max(norms["backbone"], n)
         else:
             norms["decoder"] = max(norms["decoder"], n)
     return norms
@@ -242,6 +249,7 @@ def _outputs_to_predictions(
 
         if has_masks:
             mask_logits = outputs["pred_masks"][b]  # (Q, h, w)
+            # Upsample to 256x256 and binarise
             upsampled = torch.nn.functional.interpolate(
                 mask_logits.unsqueeze(1), size=(256, 256),
                 mode="bilinear", align_corners=False,
@@ -326,7 +334,9 @@ def full_evaluate(
     official PanNuke protocol (per-tissue stratification).
     """
     model.eval()
+    # Unfiltered for mAP (needs full P-R curve)
     det_metrics = DetectionMetrics(num_classes=_NUM_CLASSES, iou_thresholds=_IOU_THRESHOLDS)
+    # Filtered for F1d / P / R (padding queries destroy precision)
     det_metrics_filt = DetectionMetrics(num_classes=_NUM_CLASSES, iou_thresholds=_IOU_THRESHOLDS)
     pq_metric = PanopticQuality(num_classes=_NUM_CLASSES, iou_threshold=0.5)
     tissue_pq: Optional[TissuePanopticQuality] = None
@@ -336,9 +346,11 @@ def full_evaluate(
 
     running_loss: dict[str, float] = {}
     count = 0
+    all_scores: list[torch.Tensor] = []
+    all_tp_flags: list[torch.Tensor] = []
     all_pred_stats: dict[str, float] = {}
     n_stats = 0
-    img_cursor = 0
+    img_cursor = 0  # tracks position in dataset for tissue_ids lookup
 
     for batch in val_loader:
         images = batch["images"].to(device)
@@ -347,12 +359,43 @@ def full_evaluate(
         targets = _batch_to_targets(batch, device)
 
         losses = criterion(outputs, targets)
+
+        # Track per-aux-layer losses
+        loss_dict: dict[str, float] = {}
         for k, v in losses.items():
             val = v.item() if isinstance(v, torch.Tensor) else v
+            loss_dict[k] = val
             running_loss[k] = running_loss.get(k, 0.0) + val
+
+        if "aux_outputs" in outputs:
+            matcher = criterion.matcher
+            for i, aux_out in enumerate(outputs["aux_outputs"]):
+                aux_pred = {
+                    "pred_logits": aux_out["class_logits"],
+                    "pred_boxes": aux_out["box_coords"],
+                }
+                aux_indices = matcher.forward(aux_pred, targets)
+                from mhc_path.training.losses import sigmoid_focal_loss_onehot
+                # Track individual aux losses
+                n_boxes = max(sum(len(t.labels) for t in targets), 1)
+                aux_logits = aux_pred["pred_logits"]
+                B_aux, Q_aux, C_aux = aux_logits.shape
+                tgt_cls = torch.full((B_aux, Q_aux), _NUM_CLASSES, dtype=torch.int64, device=device)
+                for b_i, (pi, ti) in enumerate(aux_indices):
+                    if len(pi) > 0:
+                        tgt_cls[b_i, pi] = targets[b_i].labels[ti].to(device)
+                import torch.nn.functional as F
+                tgt_oh = F.one_hot(tgt_cls, _NUM_CLASSES + 1)[..., :_NUM_CLASSES].float()
+                aux_cls_loss = sigmoid_focal_loss_onehot(
+                    aux_logits.reshape(-1, _NUM_CLASSES),
+                    tgt_oh.reshape(-1, _NUM_CLASSES),
+                    num_boxes=n_boxes,
+                ).item()
+                loss_dict[f"cls_aux{i}"] = aux_cls_loss
+
         count += 1
 
-        # Unfiltered preds for mAP (needs full P-R curve)
+        # Unfiltered preds for mAP (needs full P-R curve) and ECE — no masks needed
         preds_all = _outputs_to_predictions(outputs, score_threshold=0.0)
         det_metrics.update(preds_all, targets)
 
@@ -360,6 +403,7 @@ def full_evaluate(
         has_masks = "pred_masks" in outputs
         preds_filt = _outputs_to_predictions(
             outputs, score_threshold=score_threshold, include_masks=has_masks)
+
         det_metrics_filt.update(preds_filt, targets)
         pq_metric.update(preds_filt, targets)
 
@@ -370,7 +414,7 @@ def full_evaluate(
             tissue_pq.update(preds_filt, targets, batch_tissues)
             img_cursor += bs
 
-        # Segmentation metrics
+        # Segmentation metrics: accumulate matched mask pairs
         if has_masks:
             for pred_d, tgt in zip(preds_filt, targets):
                 if "masks" in pred_d and tgt.masks is not None:
@@ -381,9 +425,11 @@ def full_evaluate(
                         matched_p_masks, matched_t_masks = [], []
                         matched_p_labels, matched_t_labels = [], []
                         used_gt = set()
+                        # Sort preds by score descending
                         order = pred_d["scores"].argsort(descending=True)
                         for pi in order:
                             pc = pl[pi].item()
+                            # Find best unmatched GT with same class
                             best_iou, best_gi = -1.0, -1
                             for gi in range(len(tl)):
                                 if gi in used_gt:
@@ -408,6 +454,11 @@ def full_evaluate(
                                 torch.stack(matched_t_labels),
                             )
 
+        # ECE accumulators: collect scores and TP flags at IoU=0.3
+        for b in range(outputs["pred_logits"].shape[0]):
+            sc = preds_all[b]["scores"]
+            all_scores.append(sc.cpu())
+
         # Prediction stats (unfiltered — diagnostic)
         ps = _prediction_stats(outputs)
         for k2, v2 in ps.items():
@@ -417,22 +468,23 @@ def full_evaluate(
     # Aggregate
     results: dict[str, Any] = {}
 
+    # Losses
     for k, v in running_loss.items():
         results[f"val_{k}"] = v / max(count, 1)
 
-    # mAP from unfiltered preds
+    # mAP from unfiltered preds (full P-R curve)
     det_results = det_metrics.compute()
     for k, v in det_results.items():
         if k.startswith("mAP") or k.startswith("AP_class"):
             results[k] = v
 
-    # F1d, P, R from filtered preds
+    # F1d, P, R from filtered preds (score-thresholded)
     det_results_filt = det_metrics_filt.compute()
     for k, v in det_results_filt.items():
         if not (k.startswith("mAP") or k.startswith("AP_class")):
             results[k] = v
 
-    # PQ
+    # PQ (uses mask IoU when masks available)
     pq_results = pq_metric.compute()
     results.update(pq_results)
 
@@ -449,7 +501,7 @@ def full_evaluate(
     cm = det_metrics.confusion_matrix(iou_threshold=0.3)
     results["confusion_matrix_30"] = cm.tolist()
 
-    # ECE
+    # ECE — collect TP flags from det_metrics at threshold 0.3
     t30_idx = det_metrics._find_threshold_index(0.3)
     if t30_idx is not None:
         all_tp_list = []
@@ -467,6 +519,7 @@ def full_evaluate(
     else:
         results["ECE"] = 0.0
 
+    # Prediction stats (averaged)
     for k, v in all_pred_stats.items():
         results[k] = v / max(n_stats, 1)
 
@@ -513,10 +566,14 @@ def _run_post_training(
     """Run post-training diagnostics: queries sweep, timing, attention stats."""
     results: dict[str, Any] = {}
 
+    # Load best checkpoint
     ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
 
     # --- num_queries sweep ---
-    for nq in [50, 100]:
+    # Always include the training query count plus smaller ablations
+    trained_nq = model_cfg.num_queries
+    sweep_nqs = sorted(set([50, 100, trained_nq]))
+    for nq in sweep_nqs:
         cfg = MHCPathConfig(
             backbone=model_cfg.backbone,
             backbone_frozen=True,
@@ -527,8 +584,13 @@ def _run_post_training(
             with_segmentation=model_cfg.with_segmentation,
             output_layers=model_cfg.output_layers,
             fpn_levels=model_cfg.fpn_levels,
+            mask_upsample_factor=model_cfg.mask_upsample_factor,
+            with_pixel_decoder=model_cfg.with_pixel_decoder,
+            large_kernel=model_cfg.large_kernel,
+            large_kernel_size=model_cfg.large_kernel_size,
         )
         sweep_model = MHCPath(cfg).to(device)
+        # Load weights (skip query embed size mismatch)
         state = ckpt["model_state_dict"]
         filtered = {k: v for k, v in state.items()
                     if k in sweep_model.state_dict()
@@ -539,6 +601,7 @@ def _run_post_training(
         criterion = DetectionLoss(
             num_classes=_NUM_CLASSES,
             matcher=HungarianMatcher(),
+            box_loss_type="giou",
         )
         sweep_results = full_evaluate(sweep_model, val_loader, criterion, device,
                                       score_threshold=0.3)
@@ -546,8 +609,19 @@ def _run_post_training(
             "mAP@30": sweep_results.get("mAP@30", 0.0),
             "mAP@50": sweep_results.get("mAP@50", 0.0),
             "PQ": sweep_results.get("PQ", 0.0),
+            "DQ": sweep_results.get("DQ", 0.0),
+            "SQ": sweep_results.get("SQ", 0.0),
+            "mPQ": sweep_results.get("mPQ", 0.0),
+            "bPQ": sweep_results.get("bPQ", 0.0),
             "F1d@30": sweep_results.get("F1d@30", 0.0),
+            "F1d@50": sweep_results.get("F1d@50", 0.0),
+            "mIoU": sweep_results.get("mIoU", 0.0),
         }
+        # Per-class PQ breakdown
+        for c in range(_NUM_CLASSES):
+            results[f"queries_{nq}"][f"PQ_class{c}"] = sweep_results.get(f"PQ_class{c}", 0.0)
+            results[f"queries_{nq}"][f"DQ_class{c}"] = sweep_results.get(f"DQ_class{c}", 0.0)
+            results[f"queries_{nq}"][f"SQ_class{c}"] = sweep_results.get(f"SQ_class{c}", 0.0)
         del sweep_model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -568,7 +642,9 @@ def _run_post_training(
 
     # --- Backbone feature statistics ---
     bb_stats = compute_backbone_stats(model, sample_images)
-    results["backbone_stats"] = {k: v for k, v in bb_stats.items()}
+    results["backbone_stats"] = {
+        k: v for k, v in bb_stats.items()
+    }
 
     del model
     if device.type == "cuda":
@@ -598,6 +674,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, default=None,
                         help="Legacy: single fold dir (overrides multi-fold args)")
 
+    # Backbone
+    parser.add_argument("--backbone", type=str, default="dinov3_vitl16",
+                        choices=["dinov3_vitl16", "dinov3_vitb16", "dinov3_vitg14", "phikon_v2"],
+                        help="Backbone model variant (default: dinov3_vitl16)")
+
     # Common
     parser.add_argument("--out_dir", type=str, default=str(_DEFAULT_OUT_DIR))
     parser.add_argument("--epochs", type=int, default=_N_EPOCHS)
@@ -608,14 +689,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score_threshold", type=float, default=0.3,
                         help="Min score for PQ/F1d predictions (default: 0.3)")
     parser.add_argument("--skip_post_training", action="store_true")
-    parser.add_argument("--mask_loss_resolution", type=int, default=128,
-                        help="Resolution for mask loss computation (default: 128)")
-    parser.add_argument("--mask_upsample_factor", type=int, default=4,
-                        help="Upsample pixel features before dot-product mask head (default: 4)")
+    parser.add_argument("--mask_loss_resolution", type=int, default=64,
+                        help="Resolution for mask loss computation (default: 64)")
+    parser.add_argument("--mask_upsample_factor", type=int, default=1,
+                        help="Upsample pixel features before dot-product mask head (default: 1 = no upsampling)")
+
+    # Backbone unfreezing + per-group LR
+    parser.add_argument("--unfreeze_last_n", type=int, default=0,
+                        help="Unfreeze last N backbone transformer blocks (default: 0 = frozen)")
+    parser.add_argument("--lr_backbone", type=float, default=0.0,
+                        help="Base LR for unfrozen backbone params (default: 0.0)")
     parser.add_argument("--lr_fpn", type=float, default=_BASE_LR_FPN,
                         help=f"Base LR for FPN params (default: {_BASE_LR_FPN})")
     parser.add_argument("--lr_decoder", type=float, default=_BASE_LR_DECODER,
                         help=f"Base LR for decoder params (default: {_BASE_LR_DECODER})")
+
+    # Backbone freeze schedule
+    parser.add_argument("--freeze_epochs", type=int, default=0,
+                        help="Keep backbone frozen for this many epochs before unfreezing (default: 0 = unfreeze immediately)")
+
+    # Early stopping
+    parser.add_argument("--patience", type=int, default=0,
+                        help="Early stopping patience in epochs (0 = disabled, default: 0)")
+
+    # Boundary loss
+    parser.add_argument("--mask_boundary_weight", type=float, default=1.0,
+                        help="Weight for mask boundary (Sobel gradient) loss (default: 1.0)")
+
+    # Pixel decoder with ViT skip connections
+    parser.add_argument("--with_pixel_decoder", action="store_true",
+                        help="Use multi-scale pixel decoder with ViT skip connections")
+
+    # Large-kernel refinement
+    parser.add_argument("--large_kernel", action="store_true",
+                        help="Use RepLKBlock large-kernel depthwise convs in pixel decoder")
+    parser.add_argument("--large_kernel_size", type=int, default=13,
+                        help="Kernel size for large-kernel blocks (default: 13)")
+
+    # Group DETR
+    parser.add_argument("--group_detr", type=int, default=1,
+                        help="Number of query groups for Group DETR (1=off, 11=RF-DETR default)")
+
+    # Resume from checkpoint
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume training from (e.g. out_dir/checkpoints/best_pq.pt)")
 
     return parser.parse_args()
 
@@ -634,6 +751,7 @@ def main() -> None:
     # Data preparation
     # ---------------------------------------------------------------
     if legacy_mode:
+        # Single-fold: internal train/val split, no separate test set
         data_dir = Path(args.data_dir)
         ann_file = data_dir / "annotations.json"
         image_dir = str(data_dir / "images")
@@ -661,6 +779,7 @@ def main() -> None:
         fold_desc = f"legacy single-fold: {data_dir.name}"
 
     else:
+        # Multi-fold: merge training folds, hold out test fold
         data_root = Path(args.data_root)
 
         merged_coco = _merge_fold_annotations(data_root, args.train_folds)
@@ -669,6 +788,7 @@ def main() -> None:
         train_json, val_json = _split_train_val(
             merged_coco, args.val_fraction, args.seed, split_dir)
 
+        # file_names include relative path from data_root
         image_dir = str(data_root)
 
         train_ds = PathologyDetectionDataset(
@@ -708,44 +828,83 @@ def main() -> None:
     print(f"Folds: {fold_desc}")
     print(f"  Train: {len(train_ds)} images, Val: {len(val_ds)} images"
           + (f", Test: {len(test_ds)} images" if test_loader else ""))
-    print(f"Config: Frozen DINOv3-L + FPN + RF-DETR, AdamW, StainAug+geometric")
-    print(f"  CIoU box loss, num_queries={args.num_queries}")
+    print(f"Config: {args.backbone} + FPN + RF-DETR, AdamW, StainAug+geometric")
+    print(f"  GIoU box loss, num_queries={args.num_queries}")
     print(f"  {n_epochs} epochs, batch_size={args.batch_size}")
-    print(f"  lr_fpn={args.lr_fpn}, lr_decoder={args.lr_decoder}")
+    print(f"  lr_backbone={args.lr_backbone}, lr_fpn={args.lr_fpn}, lr_decoder={args.lr_decoder}")
+    if args.unfreeze_last_n > 0:
+        print(f"  unfreeze_last_n={args.unfreeze_last_n}, freeze_epochs={args.freeze_epochs}")
     print(f"  score_threshold={args.score_threshold} (for PQ/F1d)")
     print(f"  mask_loss_resolution={args.mask_loss_resolution}, mask_upsample_factor={args.mask_upsample_factor}")
+    if args.mask_boundary_weight != 1.0:
+        print(f"  mask_boundary_weight={args.mask_boundary_weight}")
+    if args.with_pixel_decoder:
+        print(f"  Pixel decoder ON (ViT skip connections)")
+    if args.large_kernel:
+        print(f"  Large-kernel refinement ON (k={args.large_kernel_size})")
+    if args.group_detr > 1:
+        print(f"  Group DETR: {args.group_detr} groups")
+    if args.patience > 0:
+        print(f"  Early stopping: patience={args.patience}")
     print(f"  warmup={_WARMUP_EPOCHS} epochs, EMA decay={_EMA_DECAY}")
     print(f"Device: {_DEVICE}")
     print("=" * 70)
 
     # --- Model ---
+    # Pixel decoder handles its own upsampling; override upsample_factor
+    _mask_upsample = 1 if args.with_pixel_decoder else args.mask_upsample_factor
     model_cfg = MHCPathConfig(
-        backbone="dinov3_vitl16", backbone_frozen=True,
+        backbone=args.backbone, backbone_frozen=True,
         fpn_dim=256, num_queries=args.num_queries, num_classes=_NUM_CLASSES,
         num_decoder_layers=6, with_segmentation=True,
         output_layers=(6, 12, 18, 24), fpn_levels=4,
-        mask_upsample_factor=args.mask_upsample_factor,
+        mask_upsample_factor=_mask_upsample,
+        with_pixel_decoder=args.with_pixel_decoder,
+        large_kernel=args.large_kernel,
+        large_kernel_size=args.large_kernel_size,
+        group_detr=args.group_detr,
     )
     model = MHCPath(model_cfg).to(_DEVICE)
 
-    # --- Augmentation: StainAug ON, geometric ON ---
+    # --- Selective backbone unfreezing ---
+    _backbone_unfrozen = False
+    if args.unfreeze_last_n > 0 and args.freeze_epochs <= 0:
+        n_unfrozen = model.backbone.unfreeze_last_n(args.unfreeze_last_n)
+        print(f"  Unfroze last {args.unfreeze_last_n} blocks: {n_unfrozen:,} params")
+        _backbone_unfrozen = True
+    elif args.unfreeze_last_n > 0 and args.freeze_epochs > 0:
+        print(f"  Backbone frozen for first {args.freeze_epochs} epochs, "
+              f"then unfreeze last {args.unfreeze_last_n} blocks")
+
+    # --- Augmentation: StainAug ON, geometric ON, HistoRotate OFF ---
     gpu_aug = GPUPathologyAugPipeline(
-        target_size=256, stain_aug=True, geometric=True,
+        target_size=256, histo_rotate=False, stain_aug=True,
+        geometric=True, mode="detection",
     ).to(_DEVICE)
 
     # --- Loss ---
     matcher = HungarianMatcher()
+    loss_weights = None
+    if args.mask_boundary_weight != 1.0:
+        loss_weights = {
+            "cls": 2.0, "bbox": 5.0, "mask": 5.0, "dice": 2.0,
+            "mask_boundary": args.mask_boundary_weight,
+        }
     criterion = DetectionLoss(
-        num_classes=_NUM_CLASSES, matcher=matcher,
+        num_classes=_NUM_CLASSES, matcher=matcher, box_loss_type="giou",
         mask_loss_resolution=args.mask_loss_resolution,
+        loss_weights=loss_weights,
+        group_detr=args.group_detr,
     )
 
     # --- Engine ---
+    n_batches = (n_train_images + args.batch_size - 1) // args.batch_size
     det_cfg = DetectionConfig(
         epochs=n_epochs, batch_size=args.batch_size,
-        lr_fpn=args.lr_fpn, lr_decoder=args.lr_decoder,
+        lr_backbone=args.lr_backbone, lr_fpn=args.lr_fpn, lr_decoder=args.lr_decoder,
         weight_decay=0.01, clip_grad_norm=1.0, ema_decay=_EMA_DECAY,
         use_amp=True,
+        total_train_steps=n_epochs * n_batches,
         output_dir=str(out_dir / "checkpoints"),
         num_workers=args.num_workers, log_interval=1000,
     )
@@ -756,21 +915,41 @@ def main() -> None:
     )
 
     # Stash initial LR on each param group for per-group cosine scheduling
-    for pg in engine.optimizer.param_groups:
-        pg["_base_lr"] = pg["lr"]
+    if engine.optimizer is not None:
+        for pg in engine.optimizer.param_groups:
+            pg["_base_lr"] = pg["lr"]
 
     # --- Logging setup ---
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    train_log = open(out_dir / "train_log.jsonl", "w")
-    val_log = open(out_dir / "val_log.jsonl", "w")
+    # --- Resume from checkpoint ---
+    start_epoch = 0
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=_DEVICE, weights_only=False)
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "ema_state_dict" in resume_ckpt:
+            engine.ema.load_state_dict(resume_ckpt["ema_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt and engine.optimizer is not None:
+            try:
+                engine.optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                print(f"  WARNING: Could not restore optimizer state: {e}")
+        start_epoch = resume_ckpt.get("epoch", 0) + 1
+        print(f"\nResumed from {args.resume}, starting at epoch {start_epoch}")
+        del resume_ckpt
+        if _DEVICE == "cuda":
+            torch.cuda.empty_cache()
+
+    train_log = open(out_dir / "train_log.jsonl", "a" if args.resume else "w")
+    val_log = open(out_dir / "val_log.jsonl", "a" if args.resume else "w")
 
     best_map30 = -1.0
     best_pq = -1.0
     best_map30_epoch = 0
     best_pq_epoch = 0
 
+    # Full config for checkpoint metadata
     full_config: dict[str, Any] = {
         "model": {
             "backbone": model_cfg.backbone,
@@ -780,21 +959,26 @@ def main() -> None:
             "num_classes": model_cfg.num_classes,
             "num_decoder_layers": model_cfg.num_decoder_layers,
             "mask_upsample_factor": model_cfg.mask_upsample_factor,
+            "group_detr": model_cfg.group_detr,
         },
         "training": {
             "epochs": n_epochs,
             "batch_size": args.batch_size,
+            "lr_backbone": args.lr_backbone,
             "lr_fpn": args.lr_fpn,
             "lr_decoder": args.lr_decoder,
+            "unfreeze_last_n": args.unfreeze_last_n,
             "warmup_epochs": _WARMUP_EPOCHS,
             "ema_decay": _EMA_DECAY,
             "clip_grad_norm": 1.0,
-            "box_loss": "ciou",
+            "box_loss": "giou",
             "mask_loss_resolution": args.mask_loss_resolution,
+            "patience": args.patience,
         },
         "augmentation": {
             "stain_aug": True,
             "geometric": True,
+            "histo_rotate": False,
         },
         "seed": args.seed,
         "folds": {
@@ -811,13 +995,34 @@ def main() -> None:
     # ===================================================================
     # Training loop
     # ===================================================================
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
+        # --- Deferred backbone unfreeze ---
+        if (args.unfreeze_last_n > 0 and args.freeze_epochs > 0
+                and epoch == args.freeze_epochs and not _backbone_unfrozen):
+            n_unfrozen = model.backbone.unfreeze_last_n(args.unfreeze_last_n)
+            _backbone_unfrozen = True
+            print(f"\n[Epoch {epoch}] Unfroze last {args.unfreeze_last_n} "
+                  f"backbone blocks: {n_unfrozen:,} params")
+            # Add unfrozen backbone params to optimizer
+            if engine.optimizer is not None:
+                bb_params = [p for p in model.backbone.parameters() if p.requires_grad]
+                if bb_params:
+                    engine.optimizer.add_param_group({
+                        "params": bb_params,
+                        "lr": args.lr_backbone,
+                        "_base_lr": args.lr_backbone,
+                    })
+                    print(f"  Added {len(bb_params)} backbone param tensors to AdamW "
+                          f"(lr={args.lr_backbone})")
+
         # --- LR schedule (per-group) ---
         lr_mult = _cosine_lr_with_warmup(epoch, _WARMUP_EPOCHS, n_epochs)
         cur_lr_fpn = args.lr_fpn * lr_mult
         cur_lr_decoder = args.lr_decoder * lr_mult
-        for pg in engine.optimizer.param_groups:
-            pg["lr"] = pg["_base_lr"] * lr_mult
+        cur_lr_backbone = args.lr_backbone * lr_mult
+        if engine.optimizer is not None:
+            for pg in engine.optimizer.param_groups:
+                pg["lr"] = pg["_base_lr"] * lr_mult
 
         # --- Train ---
         ep_t0 = time.time()
@@ -834,8 +1039,10 @@ def main() -> None:
             "train_loss_bbox": tm.get("bbox", 0.0),
             "train_loss_mask": tm.get("mask", 0.0),
             "train_loss_dice": tm.get("dice", 0.0),
+            "grad_norm_backbone": gnorms["backbone"],
             "grad_norm_fpn": gnorms["fpn"],
             "grad_norm_decoder": gnorms["decoder"],
+            "lr_backbone": cur_lr_backbone,
             "lr_fpn": cur_lr_fpn,
             "lr_decoder": cur_lr_decoder,
             "epoch_time_seconds": ep_time,
@@ -845,7 +1052,8 @@ def main() -> None:
         train_log.flush()
 
         # --- Validate ---
-        if epoch in _VAL_EPOCHS or epoch == n_epochs - 1:
+        val_epochs = {1, 5} | set(range(9, n_epochs, 10))
+        if epoch in val_epochs or epoch == n_epochs - 1:
             if _DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
@@ -853,13 +1061,15 @@ def main() -> None:
                 model, engine.val_loader, criterion, torch.device(_DEVICE),
                 score_threshold=args.score_threshold)
 
+            # Serialise: separate scalars from non-scalar
             val_rec: dict[str, Any] = {"epoch": epoch}
             for k, v in val_results.items():
                 if isinstance(v, (int, float)):
                     val_rec[k] = v
                 elif isinstance(v, list):
-                    val_rec[k] = v
+                    val_rec[k] = v  # confusion matrix
 
+            # Add per-class AP with class names
             for cls_id, cls_name in enumerate(CANONICAL_CLASSES):
                 for thresh in [0.3, 0.5, 0.75]:
                     key = f"AP_class{cls_id}@{thresh:.0%}"
@@ -892,6 +1102,14 @@ def main() -> None:
                     full_config, epoch, val_results,
                 )
 
+            # --- Periodic checkpoint (every 50 epochs) for resume safety ---
+            if (epoch + 1) % 50 == 0:
+                _save_checkpoint(
+                    ckpt_dir / "latest.pt",
+                    model, engine.ema, engine.optimizer,
+                    full_config, epoch, val_results,
+                )
+
             print(
                 f"[Epoch {epoch:3d}/{n_epochs}] "
                 f"loss={tm.get('total', 0.0):.4f} "
@@ -910,6 +1128,11 @@ def main() -> None:
                 f"gnorm fpn={gnorms['fpn']:.3f} dec={gnorms['decoder']:.3f} | "
                 f"{ep_time:.1f}s"
             )
+
+        # --- Early stopping ---
+        if args.patience > 0 and epoch > best_pq_epoch + args.patience:
+            print(f"Early stopping at epoch {epoch} (no PQ improvement since epoch {best_pq_epoch})")
+            break
 
     # --- Final checkpoint ---
     final_val = full_evaluate(
@@ -933,7 +1156,10 @@ def main() -> None:
         print(f"Evaluating on held-out test fold {args.test_fold}")
         print("=" * 70)
 
-        best_ckpt = ckpt_dir / "best_map30.pt"
+        # Reload best checkpoint for test evaluation (prefer PQ, fall back to mAP@30)
+        best_ckpt = ckpt_dir / "best_pq.pt"
+        if not best_ckpt.exists():
+            best_ckpt = ckpt_dir / "best_map30.pt"
         if best_ckpt.exists():
             ckpt = torch.load(
                 str(best_ckpt), map_location=_DEVICE, weights_only=False)
@@ -947,6 +1173,7 @@ def main() -> None:
             with open(tissue_file) as f:
                 tissue_data = json.load(f)
             tissue_map = tissue_data["image_tissues"]
+            # Build ordered list matching the test dataset
             test_tissue_ids = []
             for img_meta in test_ds._images:
                 fname = img_meta["file_name"]
@@ -958,11 +1185,12 @@ def main() -> None:
             score_threshold=args.score_threshold,
             tissue_ids=test_tissue_ids)
 
+        # Save test results
         serialisable = {
             k: v for k, v in test_results.items()
             if isinstance(v, (int, float, list))
         }
-        serialisable["checkpoint"] = "best_map30.pt"
+        serialisable["checkpoint"] = best_ckpt.name
         serialisable["test_fold"] = args.test_fold
         serialisable["train_folds"] = args.train_folds
         with open(out_dir / "test_results.json", "w") as f:
@@ -988,7 +1216,9 @@ def main() -> None:
         print("Post-training diagnostics")
         print("=" * 70)
 
-        best_ckpt = ckpt_dir / "best_map30.pt"
+        best_ckpt = ckpt_dir / "best_pq.pt"
+        if not best_ckpt.exists():
+            best_ckpt = ckpt_dir / "best_map30.pt"
         if best_ckpt.exists():
             post_results = _run_post_training(
                 model_cfg, best_ckpt, engine.val_loader,

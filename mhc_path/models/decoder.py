@@ -265,7 +265,7 @@ class SegmentationHead(nn.Module):
 
     When ``upsample_factor > 1``, pixel features are upsampled via transposed
     convolutions before the dot product so masks are produced at higher
-    native resolution (e.g. factor=4 turns 16×16 → 64×64).
+    native resolution (e.g. factor=4 turns 16x16 -> 64x64).
     """
 
     def __init__(
@@ -290,27 +290,198 @@ class SegmentationHead(nn.Module):
 
         self.pixel_proj = nn.Sequential(*layers)
 
+    def project_pixels(self, pixel_features: torch.Tensor) -> torch.Tensor:
+        """Project and upsample pixel features.
+
+        Args:
+            pixel_features: (B, C, H, W) finest-level feature map.
+
+        Returns:
+            (B, pixel_dim, H_up, W_up) projected pixel features.
+        """
+        return self.pixel_proj(pixel_features)
+
     def forward(
-        self, query_embeddings: torch.Tensor, pixel_features: torch.Tensor
-    ) -> torch.Tensor:
+        self, query_embeddings: torch.Tensor, pixel_features: torch.Tensor,
+        projected_pixels: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dot-product mask generation.
 
         Args:
             query_embeddings: (B, N_q, d_model).
             pixel_features: (B, C, H, W) finest-level feature map.
+            projected_pixels: pre-projected pixels (skip pixel_proj if given).
 
         Returns:
             mask_logits: (B, N_q, H_up, W_up).
+            p_proj: (B, pixel_dim, H_up, W_up) projected pixel features.
         """
         B, N_q, _ = query_embeddings.shape
 
         q_proj = self.query_proj(query_embeddings)
-        p_proj = self.pixel_proj(pixel_features)
+        p_proj = projected_pixels if projected_pixels is not None else self.pixel_proj(pixel_features)
 
         _, _, H, W = p_proj.shape
         p_flat = p_proj.flatten(2)
         mask_logits = torch.bmm(q_proj, p_flat)
-        return mask_logits.view(B, N_q, H, W)
+        return mask_logits.view(B, N_q, H, W), p_proj
+
+
+class RepLKBlock(nn.Module):
+    """RepLKNet-style large-kernel depthwise convolution with structural re-param.
+
+    Two parallel branches: large-kernel depthwise (default k=13) + small-kernel
+    depthwise (k=3). During inference, ``fuse()`` merges both into a single conv
+    for zero accuracy loss.
+    """
+
+    def __init__(self, channels: int, large_kernel_size: int = 13) -> None:
+        super().__init__()
+        pad_large = large_kernel_size // 2
+        self.large_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, large_kernel_size, padding=pad_large, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.small_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.large_conv(x) + self.small_conv(x)
+
+    @torch.no_grad()
+    def fuse(self) -> nn.Conv2d:
+        """Merge large + small branches into a single depthwise conv."""
+        # Fuse BN into conv weights for both branches
+        def _fuse_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
+            w = conv.weight
+            mean, var, gamma, beta = bn.running_mean, bn.running_var, bn.weight, bn.bias
+            std = (var + bn.eps).sqrt()
+            scale = (gamma / std).view(-1, 1, 1, 1)
+            fused_w = w * scale
+            fused_b = beta - mean * gamma / std
+            return fused_w, fused_b
+
+        lw, lb = _fuse_bn(self.large_conv[0], self.large_conv[1])
+        sw, sb = _fuse_bn(self.small_conv[0], self.small_conv[1])
+
+        # Pad small kernel to large kernel size and add
+        k_large = lw.shape[-1]
+        pad = (k_large - 3) // 2
+        sw_padded = F.pad(sw, [pad, pad, pad, pad])
+
+        fused = nn.Conv2d(
+            lw.shape[0], lw.shape[0], k_large,
+            padding=k_large // 2, groups=lw.shape[0], bias=True,
+        )
+        fused.weight.copy_(lw + sw_padded)
+        fused.bias.copy_(lb + sb)
+        return fused
+
+
+class PixelDecoder(nn.Module):
+    """Multi-scale pixel decoder with ViT skip connections.
+
+    Progressively upsamples FPN level-0 features from 16x16 to 128x128
+    using transposed convolutions and skip connections from intermediate
+    ViT layers. Optional large-kernel refinement at each stage.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        backbone_dim: int = 1024,
+        pixel_dim: int = 64,
+        backbone_layers: tuple[int, ...] = (24, 18, 12, 6),
+        large_kernel: bool = False,
+        large_kernel_size: int = 13,
+    ) -> None:
+        super().__init__()
+        self.backbone_layers = backbone_layers
+        self.pixel_dim = pixel_dim
+        n_stages = len(backbone_layers)
+
+        # Project FPN features to pixel_dim
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(d_model, pixel_dim, 1),
+            nn.GroupNorm(1, pixel_dim),
+        )
+
+        # Per-layer skip projections
+        self.skip_projs = nn.ModuleDict({
+            str(layer): nn.Sequential(
+                nn.Conv2d(backbone_dim, pixel_dim, 1),
+                nn.GroupNorm(1, pixel_dim),
+            )
+            for layer in backbone_layers
+        })
+
+        # Upsample + refine at each stage
+        self.upsample_convs = nn.ModuleList()
+        self.refine_convs = nn.ModuleList()
+        self.lk_blocks = nn.ModuleList()
+
+        for i in range(n_stages):
+            if i == 0:
+                # Stage 0: no upsampling (16x16 -> 16x16)
+                self.upsample_convs.append(nn.Identity())
+            else:
+                self.upsample_convs.append(
+                    nn.ConvTranspose2d(pixel_dim, pixel_dim, kernel_size=2, stride=2),
+                )
+
+            # After concat with skip: 2*pixel_dim -> pixel_dim
+            self.refine_convs.append(nn.Sequential(
+                nn.Conv2d(pixel_dim * 2, pixel_dim, 3, padding=1),
+                nn.BatchNorm2d(pixel_dim),
+                nn.ReLU(inplace=True),
+            ))
+
+            if large_kernel:
+                self.lk_blocks.append(RepLKBlock(pixel_dim, large_kernel_size))
+            else:
+                self.lk_blocks.append(None)
+
+    def forward(
+        self,
+        fpn_features: torch.Tensor,
+        backbone_features: dict[int, torch.Tensor],
+        patch_grid: tuple[int, int],
+    ) -> torch.Tensor:
+        """Build multi-scale pixel features with skip connections.
+
+        Args:
+            fpn_features: (B, d_model, H0, W0) finest FPN level.
+            backbone_features: dict mapping layer index to (B, N, C) ViT features.
+            patch_grid: (H_patches, W_patches) spatial grid from backbone.
+
+        Returns:
+            (B, pixel_dim, H_out, W_out) pixel features at ~128x128.
+        """
+        x = self.input_proj(fpn_features)  # (B, pixel_dim, 16, 16)
+
+        for i, layer_idx in enumerate(self.backbone_layers):
+            x = self.upsample_convs[i](x)
+
+            # Reshape ViT features from (B, N, C) to (B, C, H, W)
+            vit_feat = backbone_features[str(layer_idx)]
+            B, N, C = vit_feat.shape
+            pH, pW = patch_grid
+            skip = vit_feat.transpose(1, 2).reshape(B, C, pH, pW)
+            skip = self.skip_projs[str(layer_idx)](skip)
+
+            # Upsample skip to match current x resolution
+            if skip.shape[-2:] != x.shape[-2:]:
+                skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+            x = torch.cat([x, skip], dim=1)
+            x = self.refine_convs[i](x)
+
+            if self.lk_blocks[i] is not None:
+                x = x + self.lk_blocks[i](x)
+
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +508,11 @@ class RFDETRDecoder(nn.Module):
         group_detr: int = 1,
         with_segmentation: bool = True,
         mask_upsample_factor: int = 1,
+        with_pixel_decoder: bool = False,
+        backbone_dim: int = 1024,
+        backbone_layers: tuple[int, ...] = (24, 18, 12, 6),
+        large_kernel: bool = False,
+        large_kernel_size: int = 13,
     ) -> None:
         super().__init__()
 
@@ -396,6 +572,17 @@ class RFDETRDecoder(nn.Module):
         if with_segmentation:
             self.segmentation_head = SegmentationHead(
                 d_model, upsample_factor=mask_upsample_factor,
+            )
+
+        # Multi-scale pixel decoder with ViT skip connections
+        self.pixel_decoder: Optional[PixelDecoder] = None
+        if with_pixel_decoder:
+            self.pixel_decoder = PixelDecoder(
+                d_model=d_model,
+                backbone_dim=backbone_dim,
+                backbone_layers=backbone_layers,
+                large_kernel=large_kernel,
+                large_kernel_size=large_kernel_size,
             )
 
         self._reset_parameters()
@@ -460,12 +647,18 @@ class RFDETRDecoder(nn.Module):
         return input_flatten, input_spatial_shapes, input_level_start_index, None, projected_features
 
     def forward(
-        self, multi_scale_features: list[torch.Tensor],
+        self,
+        multi_scale_features: list[torch.Tensor],
+        backbone_features: Optional[dict[int, torch.Tensor]] = None,
+        patch_grid: Optional[tuple[int, int]] = None,
     ) -> dict[str, torch.Tensor]:
         """Run the decoder on multi-scale backbone features.
 
         Args:
             multi_scale_features: list of L tensors (B, C, H_l, W_l).
+            backbone_features: dict mapping ViT layer index to (B, N, C) features.
+                Required when ``pixel_decoder`` is enabled.
+            patch_grid: (H_patches, W_patches) spatial grid. Required with pixel_decoder.
 
         Returns:
             dict with keys:
@@ -556,8 +749,15 @@ class RFDETRDecoder(nn.Module):
             outputs["aux_outputs"] = aux_outputs
 
         if self.segmentation_head is not None:
-            outputs["mask_logits"] = self.segmentation_head(
-                queries, projected_features[0],
-            )
+            if self.pixel_decoder is not None and backbone_features is not None:
+                p_proj = self.pixel_decoder(projected_features[0], backbone_features, patch_grid)
+                mask_logits, _ = self.segmentation_head(
+                    queries, projected_features[0], projected_pixels=p_proj,
+                )
+            else:
+                mask_logits, _ = self.segmentation_head(
+                    queries, projected_features[0],
+                )
+            outputs["mask_logits"] = mask_logits
 
         return outputs

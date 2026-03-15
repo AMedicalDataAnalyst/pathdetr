@@ -50,9 +50,9 @@ def test_output_shapes():
 def test_trainable_parameters():
     model = _make_model()
     groups = model.trainable_parameters()
-    assert len(groups) == 2
+    assert len(groups) == 3
     names = {g["group_name"] for g in groups}
-    assert names == {"fpn", "decoder"}
+    assert names == {"backbone", "fpn", "decoder"}
 
 
 def test_backbone_frozen():

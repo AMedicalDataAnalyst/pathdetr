@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mhc-path"
 version = "1.0.0"
-description = "Histopathology detection and segmentation: DINOv3 backbone + FPN + RF-DETR decoder"
+description = "Histopathology detection and segmentation: frozen ViT backbone + FPN + RF-DETR decoder"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
+    "torchvision>=0.16",
     "numpy>=1.24",
     "scipy>=1.11",
     "Pillow>=10.0",
@@ -17,11 +18,12 @@ dependencies = [
 [project.optional-dependencies]
 train = [
     "timm>=0.9",
+    "transformers>=4.30",
     "wandb>=0.15",
 ]
 dev = [
-    "pytest>=7.0",
-    "pycocotools>=2.0",
+    "pytest>=7.4",
+    "pytest-timeout>=2.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -29,3 +31,4 @@ include = ["mhc_path*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-v --tb=short"

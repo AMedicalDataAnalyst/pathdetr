@@ -28,6 +28,7 @@ from mhc_path.models.box_utils import (
     cxcywh_to_xyxy,
     complete_box_iou_loss,
     generalized_box_iou,
+    generalized_box_iou_loss,
 )
 from mhc_path.models.util import get_world_size, is_dist_avail_and_initialized
 
@@ -235,14 +236,64 @@ _DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "bbox": 5.0,
     "mask": 5.0,
     "dice": 2.0,
+    "mask_boundary": 1.0,
+}
+
+
+# Sobel kernels for boundary loss
+_SOBEL_X = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+_SOBEL_Y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+
+
+def mask_boundary_loss(
+    pred_masks: torch.Tensor,
+    target_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Sobel gradient loss on predicted masks vs target masks.
+
+    Encourages sharp boundaries without requiring a separate HV head.
+    MSE of Sobel gradients, masked to target foreground pixels.
+
+    Args:
+        pred_masks: (N, H, W) raw mask logits (sigmoid applied internally).
+        target_masks: (N, H, W) binary target masks.
+
+    Returns:
+        Scalar boundary loss.
+    """
+    device = pred_masks.device
+    sobel_x = _SOBEL_X.to(device)
+    sobel_y = _SOBEL_Y.to(device)
+
+    pred = pred_masks.sigmoid().unsqueeze(1)   # (N, 1, H, W)
+    tgt = target_masks.float().unsqueeze(1)    # (N, 1, H, W)
+
+    pred_gx = F.conv2d(pred, sobel_x, padding=1)
+    pred_gy = F.conv2d(pred, sobel_y, padding=1)
+    tgt_gx = F.conv2d(tgt, sobel_x, padding=1)
+    tgt_gy = F.conv2d(tgt, sobel_y, padding=1)
+
+    fg = (target_masks > 0.5).unsqueeze(1).float()  # (N, 1, H, W)
+    n_fg = fg.sum().clamp(min=1.0)
+
+    diff_x = ((pred_gx - tgt_gx) ** 2) * fg
+    diff_y = ((pred_gy - tgt_gy) ** 2) * fg
+
+    return (diff_x.sum() + diff_y.sum()) / n_fg
+
+
+_BOX_LOSS_FNS = {
+    "ciou": complete_box_iou_loss,
+    "giou": generalized_box_iou_loss,
 }
 
 
 class DetectionLoss(nn.Module):
     """Combined detection + segmentation loss with auxiliary loss support.
 
-    Box regression uses CIoU loss. Classification uses sigmoid focal loss.
-    Loss normalisation: sum / num_boxes (matching RF-DETR).
+    Box regression uses CIoU (default) or GIoU loss. Classification uses
+    sigmoid focal loss. Mask loss uses BCE + Dice. Loss normalisation:
+    sum / num_boxes (matching RF-DETR).
     """
 
     def __init__(
@@ -251,6 +302,7 @@ class DetectionLoss(nn.Module):
         matcher: HungarianMatcher,
         loss_weights: Optional[dict[str, float]] = None,
         group_detr: int = 1,
+        box_loss_type: str = "ciou",
         mask_loss_resolution: int = 64,
     ) -> None:
         super().__init__()
@@ -259,6 +311,9 @@ class DetectionLoss(nn.Module):
         self.loss_weights = dict(loss_weights) if loss_weights else dict(_DEFAULT_LOSS_WEIGHTS)
         self.group_detr = group_detr
         self.mask_loss_resolution = mask_loss_resolution
+        if box_loss_type not in _BOX_LOSS_FNS:
+            raise ValueError(f"box_loss_type must be one of {list(_BOX_LOSS_FNS)}, got {box_loss_type!r}")
+        self._box_loss_fn = _BOX_LOSS_FNS[box_loss_type]
 
     def forward(
         self,
@@ -276,7 +331,7 @@ class DetectionLoss(nn.Module):
             targets: list of DetectionTarget, one per batch element.
 
         Returns:
-            Dict with keys "cls", "bbox", "mask", "dice", "total".
+            Dict with keys "cls", "bbox", "mask", "dice", "mask_boundary", "total".
         """
         group_detr = self.group_detr if self.training else 1
         outputs_no_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
@@ -296,13 +351,14 @@ class DetectionLoss(nn.Module):
 
         loss_cls = self._classification_loss(outputs_no_aux, targets, indices, num_boxes)
         loss_bbox = self._bbox_loss(outputs_no_aux, targets, indices, num_boxes)
-        loss_mask, loss_dice = self._mask_loss(outputs_no_aux, targets, indices)
+        loss_mask, loss_dice, loss_boundary = self._mask_loss(outputs_no_aux, targets, indices)
 
         total = (
             self.loss_weights.get("cls", 0.0) * loss_cls
             + self.loss_weights.get("bbox", 0.0) * loss_bbox
             + self.loss_weights.get("mask", 0.0) * loss_mask
             + self.loss_weights.get("dice", 0.0) * loss_dice
+            + self.loss_weights.get("mask_boundary", 0.0) * loss_boundary
         )
 
         # Auxiliary losses at intermediate decoder layers
@@ -325,6 +381,7 @@ class DetectionLoss(nn.Module):
             "bbox": loss_bbox,
             "mask": loss_mask,
             "dice": loss_dice,
+            "mask_boundary": loss_boundary,
             "total": total,
         }
 
@@ -376,7 +433,7 @@ class DetectionLoss(nn.Module):
         indices: list[tuple[torch.Tensor, torch.Tensor]],
         num_boxes: float,
     ) -> torch.Tensor:
-        """CIoU + L1 box loss over matched pairs, normalised by num_boxes."""
+        """IoU-based + L1 box loss over matched pairs, normalised by num_boxes."""
         device = outputs["pred_boxes"].device
         matched_pred_boxes: list[torch.Tensor] = []
         matched_tgt_boxes: list[torch.Tensor] = []
@@ -393,7 +450,7 @@ class DetectionLoss(nn.Module):
         pred_cat = torch.cat(matched_pred_boxes, dim=0)
         tgt_cat = torch.cat(matched_tgt_boxes, dim=0)
 
-        iou_loss = complete_box_iou_loss(pred_cat, tgt_cat)
+        iou_loss = self._box_loss_fn(pred_cat, tgt_cat)
         l1 = F.l1_loss(pred_cat, tgt_cat, reduction="none").sum(dim=-1)
 
         return (iou_loss.sum() + l1.sum()) / num_boxes
@@ -403,13 +460,13 @@ class DetectionLoss(nn.Module):
         outputs: dict,
         targets: list[DetectionTarget],
         indices: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sigmoid focal + dice loss over matched mask pairs."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """BCE + dice + boundary loss over matched mask pairs."""
         device = outputs["pred_logits"].device
 
         if "pred_masks" not in outputs:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero.clone()
+            return zero, zero.clone(), zero.clone()
 
         matched_pred_masks: list[torch.Tensor] = []
         matched_tgt_masks: list[torch.Tensor] = []
@@ -425,7 +482,7 @@ class DetectionLoss(nn.Module):
 
         if not matched_pred_masks:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero.clone()
+            return zero, zero.clone(), zero.clone()
 
         pred_cat = torch.cat(matched_pred_masks, dim=0)
         tgt_cat = torch.cat(matched_tgt_masks, dim=0)
@@ -443,9 +500,10 @@ class DetectionLoss(nn.Module):
                 mode="bilinear", align_corners=False,
             ).squeeze(1)
 
-        mask_focal = F.binary_cross_entropy_with_logits(
+        mask_bce = F.binary_cross_entropy_with_logits(
             pred_cat, tgt_cat.float(), reduction="mean",
         )
         mask_dice = dice_loss(pred_cat, tgt_cat)
+        loss_boundary = mask_boundary_loss(pred_cat, tgt_cat)
 
-        return mask_focal, mask_dice
+        return mask_bce, mask_dice, loss_boundary

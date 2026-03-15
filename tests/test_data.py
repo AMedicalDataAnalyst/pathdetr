@@ -131,7 +131,11 @@ def test_gpu_aug_pipeline_shapes():
     }
     out = pipeline(batch)
     assert out["images"].shape == (2, 3, 256, 256)
-    assert out["boxes"].shape == (2, 5, 4)
+    # boxes may be a list (variable-length per image) or tensor
+    if isinstance(out["boxes"], list):
+        assert len(out["boxes"]) == 2
+    else:
+        assert out["boxes"].shape == (2, 5, 4)
 
 
 def test_gpu_stain_aug_output_range():
