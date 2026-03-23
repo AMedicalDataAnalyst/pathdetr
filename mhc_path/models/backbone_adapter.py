@@ -287,6 +287,83 @@ class DINOv3Backbone(nn.Module):
         """Patch grid size for the last forward pass's input (or default 256x256)."""
         return (256 // self._patch_size, 256 // self._patch_size)
 
+    def forward_with_queries(
+        self,
+        x: torch.Tensor,
+        queries: torch.Tensor,
+        num_inject_blocks: int = 4,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """EoMT-style forward: inject queries into final ViT blocks.
+
+        Runs the first (N - num_inject_blocks) blocks normally (no grad),
+        then concatenates queries and runs the remaining blocks with
+        joint attention between patches and queries.
+
+        Args:
+            x: (B, 3, H, W) input images.
+            queries: (B, N_q, embed_dim) learnable query embeddings.
+            num_inject_blocks: Number of final blocks where queries participate.
+
+        Returns:
+            (output_tokens, aux_outputs) where output_tokens is
+            (B, N_q + N_patches, embed_dim) and aux_outputs is a list of
+            intermediate block outputs (for auxiliary losses).
+        """
+        blocks = self._get_blocks()
+        total_blocks = len(blocks)
+        inject_at = total_blocks - num_inject_blocks
+
+        # --- Patch embedding (frozen) ---
+        if self._is_timm:
+            patch_tokens = self.backbone.patch_embed(x)
+            # _pos_embed handles pos encoding, cls/reg token prepending, RoPE
+            patch_tokens, _ = self.backbone._pos_embed(patch_tokens)
+            if hasattr(self.backbone, 'norm_pre'):
+                patch_tokens = self.backbone.norm_pre(patch_tokens)
+            # Strip prefix tokens (cls + register) to get patch-only
+            n_prefix = getattr(self.backbone, 'num_prefix_tokens', 0)
+            if n_prefix > 0:
+                patch_tokens = patch_tokens[:, n_prefix:, :]
+        elif self._is_hf:
+            embeddings = self.backbone.embeddings(x)
+            # Strip CLS token
+            patch_tokens = embeddings[:, 1:, :]
+        else:
+            patch_tokens = self.backbone.patch_embed(x)
+            B_pe, C_pe, H_pe, W_pe = patch_tokens.shape
+            patch_tokens = patch_tokens.flatten(2).transpose(1, 2)
+            if patch_tokens.shape[1] != self.backbone.pos_embed.shape[1]:
+                patch_tokens = patch_tokens + self.backbone._interpolate_pos(
+                    patch_tokens.shape[1], H_pe, W_pe)
+            else:
+                patch_tokens = patch_tokens + self.backbone.pos_embed
+
+        # --- Run frozen blocks (0 to inject_at-1) without grad ---
+        with torch.no_grad():
+            for i in range(inject_at):
+                patch_tokens = blocks[i](patch_tokens)
+        patch_tokens = patch_tokens.detach()
+
+        # --- Inject queries and run final blocks with grad ---
+        # queries: (B, N_q, C), patch_tokens: (B, N_patch, C)
+        tokens = torch.cat([queries, patch_tokens], dim=1)
+
+        aux_outputs: list[torch.Tensor] = []
+        for i in range(inject_at, total_blocks):
+            tokens = blocks[i](tokens)
+            # Collect intermediate outputs for auxiliary losses
+            if i < total_blocks - 1:
+                aux_outputs.append(tokens)
+
+        # Apply final norm if it exists
+        for norm_name in ("norm", "layernorm"):
+            norm = getattr(self.backbone, norm_name, None)
+            if norm is not None:
+                tokens = norm(tokens)
+                break
+
+        return tokens, aux_outputs
+
     def freeze_backbone(self) -> None:
         for param in self.backbone.parameters():
             param.requires_grad = False

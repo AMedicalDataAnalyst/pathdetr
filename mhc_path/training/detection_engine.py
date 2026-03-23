@@ -146,6 +146,7 @@ class DetectionEngine:
 
         self.metrics = metrics
         self.optimizer: Optional[torch.optim.AdamW] = None
+        self.dn_generator = None  # set externally for denoising training
         self._build_optimizer()
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
         self.ema = _EMAModel(model, decay=config.ema_decay)
@@ -232,6 +233,14 @@ class DetectionEngine:
 
     def _normalize_output(self, raw: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Normalise model output keys for the loss module."""
+        # EoMT outputs mask_logits + class_logits directly (no boxes).
+        # Pass through as-is — the EoMTLoss handles these keys.
+        if "box_coords" not in raw and "pred_boxes" not in raw:
+            out = dict(raw)
+            if "aux_outputs" in raw:
+                out["aux_outputs"] = raw["aux_outputs"]
+            return out
+
         out: dict[str, torch.Tensor] = {}
         out["pred_logits"] = raw["pred_logits"] if "pred_logits" in raw else raw["class_logits"]
         out["pred_boxes"] = raw["pred_boxes"] if "pred_boxes" in raw else raw["box_coords"]
@@ -264,8 +273,44 @@ class DetectionEngine:
 
             amp_dev = "cuda" if self.device.type == "cuda" else "cpu"
             with torch.amp.autocast(amp_dev, enabled=self.config.use_amp):
-                outputs = self._normalize_output(self.model(batch["images"]))
-                losses = self.criterion(outputs, targets)
+                # Denoising training: generate noised GT queries
+                dn_kwargs: dict = {}
+                dn_out = None
+                if self.dn_generator is not None:
+                    gt_boxes = [t.boxes for t in targets]
+                    gt_labels = [t.labels for t in targets]
+                    n_q = self.model.config.num_queries if hasattr(self.model, 'config') else 100
+                    dn_out = self.dn_generator(
+                        gt_boxes, gt_labels, num_queries=n_q
+                    )
+                    if dn_out is not None:
+                        dn_kwargs = {
+                            "dn_queries": dn_out.dn_queries,
+                            "dn_reference_points": dn_out.dn_reference_points,
+                            "dn_attn_mask": dn_out.dn_mask,
+                        }
+
+                outputs = self._normalize_output(
+                    self.model(batch["images"], **dn_kwargs))
+
+                # Split denoising outputs and compute losses
+                if dn_out is not None:
+                    from mhc_path.training.denoising import (
+                        split_denoising_outputs, denoising_loss,
+                    )
+                    matching_out, dn_pred = split_denoising_outputs(
+                        outputs, dn_out.n_dn)
+                    losses = self.criterion(matching_out, targets)
+                    dn_losses = denoising_loss(
+                        dn_pred, dn_out.dn_labels, dn_out.dn_boxes,
+                        num_classes=self.criterion.num_classes,
+                    )
+                    losses["total"] = (losses["total"]
+                                       + dn_losses["dn_loss_cls"]
+                                       + dn_losses["dn_loss_box"])
+                    losses.update(dn_losses)
+                else:
+                    losses = self.criterion(outputs, targets)
 
             (self.scaler.scale(losses["total"]).backward() if self.config.use_amp
              else losses["total"].backward())

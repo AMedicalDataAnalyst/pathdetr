@@ -7,9 +7,9 @@ all three fold rotations and aggregate with ``aggregate_pannuke_cv.py``.
 Config derived from factorial experiment results:
   ON:  StainAug, geometric aug, AdamW for FPN+decoder
   GIoU box loss, BCE+Dice mask loss
-  200 epochs, batch_size=32, validate every 10 epochs + at {1, 5}
+  200 epochs, batch_size=64, validate every 10 epochs + at {1, 5}
   lr_fpn=5e-4, lr_decoder=1e-3, cosine LR with 10-epoch warmup
-  clip_grad_norm=1.0, EMA decay=0.998, num_queries=100
+  clip_grad_norm=1.0, EMA decay=0.998, num_queries=300
 
 Usage (3-fold CV — recommended):
   python -m experiments.train_pannuke --train_folds 1 2 --test_fold 3
@@ -50,7 +50,7 @@ from mhc_path.evaluation.metrics import (
     expected_calibration_error,
 )
 from mhc_path.models.box_utils import cxcywh_to_xyxy
-from mhc_path.models.mhc_path import MHCPath, MHCPathConfig
+from mhc_path.models.mhc_path import MHCPath, MHCPathConfig, MHCPathEoMT
 from mhc_path.training.detection_engine import (
     DetectionConfig,
     DetectionEngine,
@@ -69,7 +69,7 @@ _DEFAULT_OUT_DIR = _PROJECT_ROOT / "experiments" / "pannuke_split1"
 
 _VAL_FRACTION = 0.1
 _N_EPOCHS = 200
-_BATCH_SIZE = 32
+_BATCH_SIZE = 64
 _VAL_EPOCHS = {1, 5} | set(range(9, _N_EPOCHS, 10))  # 1, 5, then every 10
 _WARMUP_EPOCHS = 10
 _NUM_CLASSES = 5
@@ -79,7 +79,7 @@ _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _BASE_LR_FPN = 5e-4
 _BASE_LR_DECODER = 1e-3
 _EMA_DECAY = 0.998
-_NUM_QUERIES = 100
+_NUM_QUERIES = 300
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +196,35 @@ def _cosine_lr_with_warmup(epoch: int, warmup: int, total: int) -> float:
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _linear_lr_with_warmup(epoch: int, warmup: int, total: int) -> float:
+    """Linear decay from 1.0 to 0.0 after warmup."""
+    if epoch < warmup:
+        return (epoch + 1) / warmup
+    return 1.0 - (epoch - warmup) / max(1, total - warmup)
+
+
+def _trapezoidal_lr_with_warmup(epoch: int, warmup: int, total: int,
+                                 cooldown_frac: float = 0.4) -> float:
+    """Constant LR then linear cooldown.
+
+    Warmup → constant at 1.0 → linear cooldown to 0 over last cooldown_frac of training.
+    """
+    if epoch < warmup:
+        return (epoch + 1) / warmup
+    cooldown_start = int(total * (1 - cooldown_frac))
+    if epoch < cooldown_start:
+        return 1.0
+    progress = (epoch - cooldown_start) / max(1, total - cooldown_start)
+    return 1.0 - progress
+
+
+LR_SCHEDULE_FNS = {
+    "cosine": _cosine_lr_with_warmup,
+    "linear": _linear_lr_with_warmup,
+    "trapezoidal": _trapezoidal_lr_with_warmup,
+}
+
+
 def _set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for pg in optimizer.param_groups:
         pg["lr"] = lr
@@ -274,11 +303,33 @@ def _outputs_to_predictions(
 def _normalize_output(raw: dict) -> dict:
     out: dict[str, torch.Tensor] = {}
     out["pred_logits"] = raw.get("pred_logits", raw.get("class_logits"))
-    out["pred_boxes"] = raw.get("pred_boxes", raw.get("box_coords"))
     if "pred_masks" in raw:
         out["pred_masks"] = raw["pred_masks"]
     elif "mask_logits" in raw:
         out["pred_masks"] = raw["mask_logits"]
+
+    # EoMT: no boxes — derive from masks
+    if raw.get("pred_boxes") is None and raw.get("box_coords") is None:
+        from mhc_path.models.eomt_decoder import masks_to_boxes
+        mask_key = "pred_masks" if "pred_masks" in out else "mask_logits"
+        if mask_key in out:
+            out["pred_boxes"] = masks_to_boxes(out[mask_key])
+        else:
+            out["pred_boxes"] = torch.zeros(
+                out["pred_logits"].shape[0], out["pred_logits"].shape[1], 4,
+                device=out["pred_logits"].device)
+        # EoMT uses softmax (num_classes+1), but detection metrics expect
+        # sigmoid-style logits (num_classes). Strip the "no object" class.
+        if out["pred_logits"] is not None:
+            n_cls = out["pred_logits"].shape[-1]
+            if n_cls == _NUM_CLASSES + 1:
+                # Convert softmax logits to sigmoid-compatible:
+                # take the real class logits, subtract the no-object logit
+                no_obj = out["pred_logits"][..., -1:]
+                out["pred_logits"] = out["pred_logits"][..., :-1] - no_obj
+    else:
+        out["pred_boxes"] = raw.get("pred_boxes", raw.get("box_coords"))
+
     if "aux_outputs" in raw:
         out["aux_outputs"] = raw["aux_outputs"]
     return out
@@ -541,7 +592,7 @@ def _save_checkpoint(
     metrics: dict,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    ckpt = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "ema_state_dict": ema.state_dict(),
@@ -549,7 +600,8 @@ def _save_checkpoint(
         "config": config,
         "metrics": {k: v for k, v in metrics.items()
                     if not isinstance(v, (list, dict))},
-    }, str(path))
+    }
+    torch.save(ckpt, str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -685,14 +737,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=_BATCH_SIZE)
     parser.add_argument("--num_queries", type=int, default=_NUM_QUERIES)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--score_threshold", type=float, default=0.3,
                         help="Min score for PQ/F1d predictions (default: 0.3)")
     parser.add_argument("--skip_post_training", action="store_true")
-    parser.add_argument("--mask_loss_resolution", type=int, default=64,
-                        help="Resolution for mask loss computation (default: 64)")
-    parser.add_argument("--mask_upsample_factor", type=int, default=1,
-                        help="Upsample pixel features before dot-product mask head (default: 1 = no upsampling)")
+    parser.add_argument("--mask_loss_resolution", type=int, default=128,
+                        help="Resolution for mask loss computation (default: 128)")
+    parser.add_argument("--mask_upsample_factor", type=int, default=4,
+                        help="Upsample pixel features before dot-product mask head (default: 4)")
 
     # Backbone unfreezing + per-group LR
     parser.add_argument("--unfreeze_last_n", type=int, default=0,
@@ -703,6 +755,13 @@ def parse_args() -> argparse.Namespace:
                         help=f"Base LR for FPN params (default: {_BASE_LR_FPN})")
     parser.add_argument("--lr_decoder", type=float, default=_BASE_LR_DECODER,
                         help=f"Base LR for decoder params (default: {_BASE_LR_DECODER})")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="AdamW weight decay (default: 1e-4, following RF-DETR)")
+    parser.add_argument("--lr_scaling", type=str, default="linear",
+                        choices=["linear", "sqrt", "none"],
+                        help="LR scaling rule when batch_size differs from ref (default: linear)")
+    parser.add_argument("--ref_batch_size", type=int, default=32,
+                        help="Reference batch size for LR scaling (default: 32)")
 
     # Backbone freeze schedule
     parser.add_argument("--freeze_epochs", type=int, default=0,
@@ -727,18 +786,64 @@ def parse_args() -> argparse.Namespace:
                         help="Kernel size for large-kernel blocks (default: 13)")
 
     # Group DETR
-    parser.add_argument("--group_detr", type=int, default=1,
+    parser.add_argument("--group_detr", type=int, default=3,
                         help="Number of query groups for Group DETR (1=off, 11=RF-DETR default)")
+
+    # Decoder architecture
+    parser.add_argument("--decoder", type=str, default="rfdetr",
+                        choices=["rfdetr", "eomt"],
+                        help="Decoder architecture (default: rfdetr)")
+
+    # Denoising training
+    parser.add_argument("--use_denoising", action="store_true",
+                        help="Enable DN-DETR-style denoising training (RF-DETR decoder only)")
+    parser.add_argument("--dn_groups", type=int, default=3,
+                        help="Number of denoising query groups per GT (default: 3, DN-DETR uses 5)")
+    parser.add_argument("--dn_label_noise", type=float, default=0.2,
+                        help="Label noise ratio for denoising (default: 0.2, DN-DETR original)")
+    parser.add_argument("--dn_box_noise", type=float, default=0.4,
+                        help="Box noise scale for denoising (default: 0.4)")
+
+    # LR schedule
+    parser.add_argument("--lr_schedule", type=str, default="cosine",
+                        choices=["cosine", "linear", "trapezoidal"],
+                        help="LR schedule type (default: cosine). "
+                             "linear = linear decay to 0. "
+                             "trapezoidal = constant then linear cooldown.")
 
     # Resume from checkpoint
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume training from (e.g. out_dir/checkpoints/best_pq.pt)")
+    parser.add_argument("--schedule_free_restart", action="store_true",
+                        help="On resume, restart cosine LR schedule for the remaining epochs "
+                             "(warm restart). Without this, the schedule spans 0..epochs, "
+                             "which causes an LR jump when extending a completed run.")
 
     return parser.parse_args()
 
 
+def _apply_lr_scaling(args: argparse.Namespace) -> None:
+    """Scale LRs when batch_size differs from ref_batch_size.
+
+    Linear rule (Goyal et al. 2017): lr *= bs / ref_bs.
+    Sqrt rule (Hoffer et al. 2017): lr *= sqrt(bs / ref_bs).
+    Only scales lr_fpn and lr_decoder; lr_backbone is left untouched
+    (backbone is typically frozen or at a very low, hand-tuned LR).
+    """
+    if args.lr_scaling == "none" or args.batch_size == args.ref_batch_size:
+        return
+    ratio = args.batch_size / args.ref_batch_size
+    if args.lr_scaling == "sqrt":
+        ratio = math.sqrt(ratio)
+    args.lr_fpn *= ratio
+    args.lr_decoder *= ratio
+    print(f"LR scaling ({args.lr_scaling}): bs {args.ref_batch_size}->{args.batch_size}, "
+          f"lr_decoder={args.lr_decoder:.2e}, lr_fpn={args.lr_fpn:.2e}")
+
+
 def main() -> None:
     args = parse_args()
+    _apply_lr_scaling(args)
     seed_everything(args.seed, deterministic=False)
     t0 = time.time()
 
@@ -864,7 +969,24 @@ def main() -> None:
         large_kernel_size=args.large_kernel_size,
         group_detr=args.group_detr,
     )
-    model = MHCPath(model_cfg).to(_DEVICE)
+    if args.decoder == "eomt":
+        model = MHCPathEoMT(model_cfg).to(_DEVICE)
+        print(f"  Using EoMT decoder (queries injected into final 4 ViT blocks)")
+    else:
+        model = MHCPath(model_cfg).to(_DEVICE)
+
+    # --- Denoising training setup ---
+    dn_generator = None
+    if args.use_denoising and args.decoder == "rfdetr":
+        from mhc_path.training.denoising import DenoisingGenerator
+        dn_generator = DenoisingGenerator(
+            d_model=256, num_classes=_NUM_CLASSES,
+            num_dn_groups=args.dn_groups,
+            box_noise_scale=args.dn_box_noise,
+            label_noise_ratio=args.dn_label_noise,
+        ).to(_DEVICE)
+        print(f"  Denoising training: {args.dn_groups} groups, "
+              f"box_noise={args.dn_box_noise}, label_noise={args.dn_label_noise}")
 
     # --- Selective backbone unfreezing ---
     _backbone_unfrozen = False
@@ -890,19 +1012,23 @@ def main() -> None:
             "cls": 2.0, "bbox": 5.0, "mask": 5.0, "dice": 2.0,
             "mask_boundary": args.mask_boundary_weight,
         }
-    criterion = DetectionLoss(
-        num_classes=_NUM_CLASSES, matcher=matcher, box_loss_type="giou",
-        mask_loss_resolution=args.mask_loss_resolution,
-        loss_weights=loss_weights,
-        group_detr=args.group_detr,
-    )
+    if args.decoder == "eomt":
+        from mhc_path.training.eomt_loss import EoMTLoss
+        criterion = EoMTLoss(num_classes=_NUM_CLASSES)
+    else:
+        criterion = DetectionLoss(
+            num_classes=_NUM_CLASSES, matcher=matcher, box_loss_type="giou",
+            mask_loss_resolution=args.mask_loss_resolution,
+            loss_weights=loss_weights,
+            group_detr=args.group_detr,
+        )
 
     # --- Engine ---
     n_batches = (n_train_images + args.batch_size - 1) // args.batch_size
     det_cfg = DetectionConfig(
         epochs=n_epochs, batch_size=args.batch_size,
         lr_backbone=args.lr_backbone, lr_fpn=args.lr_fpn, lr_decoder=args.lr_decoder,
-        weight_decay=0.01, clip_grad_norm=1.0, ema_decay=_EMA_DECAY,
+        weight_decay=args.weight_decay, clip_grad_norm=1.0, ema_decay=_EMA_DECAY,
         use_amp=True,
         total_train_steps=n_epochs * n_batches,
         output_dir=str(out_dir / "checkpoints"),
@@ -914,11 +1040,14 @@ def main() -> None:
         gpu_aug=gpu_aug, config=det_cfg, criterion=criterion, metrics=det_metrics,
     )
 
+    # --- Denoising training ---
+    if dn_generator is not None:
+        engine.dn_generator = dn_generator
+
     # Stash initial LR on each param group for per-group cosine scheduling
     if engine.optimizer is not None:
         for pg in engine.optimizer.param_groups:
             pg["_base_lr"] = pg["lr"]
-
     # --- Logging setup ---
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
@@ -949,6 +1078,30 @@ def main() -> None:
     best_map30_epoch = 0
     best_pq_epoch = 0
 
+    # On resume, recover best metrics from existing val_log to avoid
+    # overwriting best_pq.pt / best_map30.pt with worse checkpoints
+    if args.resume:
+        val_log_path = out_dir / "val_log.jsonl"
+        if val_log_path.exists():
+            with open(val_log_path) as _vl:
+                for _line in _vl:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _d = json.loads(_line)
+                    except Exception:
+                        continue
+                    if _d.get("PQ", 0) > best_pq:
+                        best_pq = _d["PQ"]
+                        best_pq_epoch = _d.get("epoch", 0)
+                    if _d.get("mAP@30", 0) > best_map30:
+                        best_map30 = _d["mAP@30"]
+                        best_map30_epoch = _d.get("epoch", 0)
+            if best_pq > 0:
+                print(f"  Recovered best PQ={best_pq:.4f} (epoch {best_pq_epoch}), "
+                      f"best mAP@30={best_map30:.4f} (epoch {best_map30_epoch})")
+
     # Full config for checkpoint metadata
     full_config: dict[str, Any] = {
         "model": {
@@ -969,7 +1122,10 @@ def main() -> None:
             "lr_decoder": args.lr_decoder,
             "unfreeze_last_n": args.unfreeze_last_n,
             "warmup_epochs": _WARMUP_EPOCHS,
+            "lr_schedule": args.lr_schedule,
             "ema_decay": _EMA_DECAY,
+            "lr_scaling": args.lr_scaling,
+            "ref_batch_size": args.ref_batch_size,
             "clip_grad_norm": 1.0,
             "box_loss": "giou",
             "mask_loss_resolution": args.mask_loss_resolution,
@@ -1016,7 +1172,15 @@ def main() -> None:
                           f"(lr={args.lr_backbone})")
 
         # --- LR schedule (per-group) ---
-        lr_mult = _cosine_lr_with_warmup(epoch, _WARMUP_EPOCHS, n_epochs)
+        schedule_fn = LR_SCHEDULE_FNS[args.lr_schedule]
+        # Warm restart: remap epoch so the cycle covers start_epoch..n_epochs
+        if args.schedule_free_restart and start_epoch > 0:
+            remaining = n_epochs - start_epoch
+            warmup_restart = min(5, remaining // 10)  # short warmup for restart
+            lr_mult = schedule_fn(
+                epoch - start_epoch, warmup_restart, remaining)
+        else:
+            lr_mult = schedule_fn(epoch, _WARMUP_EPOCHS, n_epochs)
         cur_lr_fpn = args.lr_fpn * lr_mult
         cur_lr_decoder = args.lr_decoder * lr_mult
         cur_lr_backbone = args.lr_backbone * lr_mult

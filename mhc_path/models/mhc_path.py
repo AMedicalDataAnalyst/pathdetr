@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from mhc_path.models.backbone_adapter import DINOv3Backbone
 from mhc_path.models.decoder import RFDETRDecoder
+from mhc_path.models.eomt_decoder import EoMTDecoder
 from mhc_path.models.fpn import PathologyFPN
 
 
@@ -114,11 +115,20 @@ class MHCPath(nn.Module):
             large_kernel_size=config.large_kernel_size,
         )
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        dn_queries: torch.Tensor | None = None,
+        dn_reference_points: torch.Tensor | None = None,
+        dn_attn_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """End-to-end forward: images -> detections (+ optional masks).
 
         Args:
             images: ``(B, 3, H, W)`` input tensor.
+            dn_queries: Optional denoising queries ``(B, N_dn, d_model)``.
+            dn_reference_points: Optional denoising reference points ``(B, N_dn, 4)``.
+            dn_attn_mask: Optional attention mask ``(N_dn + N_q, N_dn + N_q)``.
 
         Returns:
             Dictionary with keys ``"class_logits"``, ``"box_coords"``,
@@ -134,7 +144,12 @@ class MHCPath(nn.Module):
             backbone_features = multi_layer_features
             patch_grid = spatial_shapes
 
-        return self.decoder(fpn_features, backbone_features, patch_grid)
+        return self.decoder(
+            fpn_features, backbone_features, patch_grid,
+            dn_queries=dn_queries,
+            dn_reference_points=dn_reference_points,
+            dn_attn_mask=dn_attn_mask,
+        )
 
     @classmethod
     def from_pretrained_backbone(cls, config: MHCPathConfig) -> "MHCPath":
@@ -152,5 +167,67 @@ class MHCPath(nn.Module):
         return [
             {"params": backbone_params, "group_name": "backbone"},
             {"params": fpn_params, "group_name": "fpn"},
+            {"params": decoder_params, "group_name": "decoder"},
+        ]
+
+
+# ---------------------------------------------------------------------------
+# EoMT variant: encoder-only (no FPN, no separate decoder)
+# ---------------------------------------------------------------------------
+
+class MHCPathEoMT(nn.Module):
+    """EoMT-style model: queries injected into final ViT blocks.
+
+    Purely mask-based — no FPN, no separate decoder, no box predictions.
+    The ViT backbone processes queries alongside patch tokens in its
+    final 4 blocks. Outputs per-query masks and class logits.
+    """
+
+    def __init__(self, config: MHCPathConfig) -> None:
+        super().__init__()
+        self.config = config
+
+        self.backbone = DINOv3Backbone(
+            model_name=config.backbone,
+            frozen=config.backbone_frozen,
+            output_layers=config.output_layers,
+        )
+
+        self.decoder = EoMTDecoder(
+            embed_dim=self.backbone._embed_dim,
+            num_queries=config.num_queries,
+            num_classes=config.num_classes,
+            num_inject_blocks=4,
+            num_upscale_blocks=2,
+        )
+
+    def forward(self, images: torch.Tensor, **kwargs) -> dict[str, torch.Tensor]:
+        """Forward pass: images → per-query masks and class logits.
+
+        Returns:
+            dict with 'mask_logits' (B, Q, H_up, W_up),
+            'class_logits' (B, Q, num_classes+1),
+            and optionally 'aux_outputs'.
+        """
+        queries = self.decoder.query_embed.weight[None].expand(
+            images.shape[0], -1, -1
+        )
+        tokens, aux_outputs = self.backbone.forward_with_queries(
+            images, queries, num_inject_blocks=4,
+        )
+        return self.decoder(tokens, self.backbone.num_patches, aux_outputs)
+
+    @classmethod
+    def from_pretrained_backbone(cls, config: MHCPathConfig) -> "MHCPathEoMT":
+        return cls(config)
+
+    def trainable_parameters(self) -> list[dict]:
+        backbone_params = [
+            p for p in self.backbone.parameters() if p.requires_grad
+        ]
+        decoder_params = list(self.decoder.parameters())
+        return [
+            {"params": backbone_params, "group_name": "backbone"},
+            {"params": [], "group_name": "fpn"},
             {"params": decoder_params, "group_name": "decoder"},
         ]

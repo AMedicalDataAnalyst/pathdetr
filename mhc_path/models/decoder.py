@@ -180,6 +180,7 @@ class DeformableDecoderLayer(nn.Module):
         input_level_start_index: torch.Tensor,
         input_padding_mask: Optional[torch.Tensor] = None,
         group_detr: int = 1,
+        sa_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -191,6 +192,7 @@ class DeformableDecoderLayer(nn.Module):
             input_level_start_index: (n_levels,) start indices in flattened dim.
             input_padding_mask: (B, sum(H_l*W_l)) or None.
             group_detr: number of query groups for Group DETR.
+            sa_attn_mask: (N_q, N_q) bool mask for self-attention (True = block).
 
         Returns:
             (B, N_q, d_model) updated query embeddings.
@@ -207,7 +209,8 @@ class DeformableDecoderLayer(nn.Module):
             sa_out = sa_out.reshape(B, N_q, C)
         else:
             q_with_pos = query + query_pos
-            sa_out, _ = self.self_attn(q_with_pos, q_with_pos, query)
+            sa_out, _ = self.self_attn(
+                q_with_pos, q_with_pos, query, attn_mask=sa_attn_mask)
 
         query = self.norm1(query + self.dropout1(sa_out))
 
@@ -651,6 +654,9 @@ class RFDETRDecoder(nn.Module):
         multi_scale_features: list[torch.Tensor],
         backbone_features: Optional[dict[int, torch.Tensor]] = None,
         patch_grid: Optional[tuple[int, int]] = None,
+        dn_queries: Optional[torch.Tensor] = None,
+        dn_reference_points: Optional[torch.Tensor] = None,
+        dn_attn_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Run the decoder on multi-scale backbone features.
 
@@ -688,6 +694,13 @@ class RFDETRDecoder(nn.Module):
         reference_points = refpoint.unsqueeze(0).expand(B, -1, -1)  # (B, N_q, 4)
         queries = content.unsqueeze(0).expand(B, -1, -1)  # (B, N_q, d_model)
 
+        # Prepend denoising queries if provided
+        n_dn = 0
+        if dn_queries is not None and dn_reference_points is not None:
+            n_dn = dn_queries.shape[1]
+            queries = torch.cat([dn_queries, queries], dim=1)
+            reference_points = torch.cat([dn_reference_points, reference_points], dim=1)
+
         n_levels = input_spatial_shapes.shape[0]
         aux_outputs: list[dict[str, torch.Tensor]] = []
         final_box_coords: Optional[torch.Tensor] = None
@@ -707,6 +720,7 @@ class RFDETRDecoder(nn.Module):
                 input_flatten, input_spatial_shapes,
                 input_level_start_index, input_padding_mask,
                 group_detr=group_detr,
+                sa_attn_mask=dn_attn_mask if n_dn > 0 else None,
             )
 
             # Iterative box refinement: predict delta and update reference points
