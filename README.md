@@ -226,9 +226,23 @@ python -m experiments.train_pannuke \
     --weight_decay 1e-4
 ```
 
-### 7. Combined best (3-fold CV)
+### 7. SAHI evaluation (post-training, on any checkpoint)
 
-After ablations 5-6, combine the winners with the best backbone and decoder for final evaluation.
+Slicing Aided Hyper Inference: runs the model on overlapping crops of each image plus the full image, then merges predictions with NMS. Inference-only — no retraining needed. Tests multiple slice sizes to find the optimal configuration.
+
+```bash
+python -m experiments.eval_sahi \
+    --checkpoint experiments/phikon_v2/fold3/checkpoints/best_pq.pt \
+    --data_root data --test_fold 3 \
+    --backbone phikon_v2 \
+    --slice_sizes 96 128 192 \
+    --overlap_ratios 0.25 \
+    --out_dir experiments/sahi_eval
+```
+
+### 8. Combined best (3-fold CV)
+
+After ablations 5-7, combine the winners with the best backbone and decoder for final evaluation.
 
 ```bash
 python -m experiments.run_3fold_cv \
@@ -277,5 +291,6 @@ experiments/
 ├── train_pannuke.py           # Main training script
 ├── run_3fold_cv.py            # 3-fold CV runner
 ├── benchmark_batch_scaling.py # GPU memory/throughput profiler
+├── eval_sahi.py               # SAHI evaluation comparison
 tests/               # Unit tests per component
 ```
