@@ -29,7 +29,43 @@ pip install torch torchvision timm transformers kornia scipy wandb
 
 ## Data Preparation
 
-PanNuke data should be in `data/pannuke_fold{1,2,3}/` with COCO-format `annotations.json` and `images/` subdirectory per fold.
+### Download PanNuke
+
+Download the three PanNuke folds from the official source (https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/) and extract so you have:
+
+```
+data/pannuke_raw/
+  fold1/
+    images.npy   # (N, 256, 256, 3)
+    masks.npy    # (N, 256, 256, 6) — channels 0-4 are cell classes, 5 is background
+    types.npy    # (N,) tissue type indices
+  fold2/
+    ...
+  fold3/
+    ...
+```
+
+### Convert to COCO format
+
+```bash
+python -m mhc_path.data.converters --raw_dir data/pannuke_raw --output_dir data --validate
+```
+
+This converts raw `.npy` files into COCO-format annotations with per-instance masks and bounding boxes, applying the correct PanNuke channel-to-class mapping (raw channels 2-4 are connective/dead/epithelial, not epithelial/connective/dead). It also extracts per-image tissue type labels needed for mPQ/bPQ evaluation.
+
+After conversion you should have:
+
+```
+data/
+  pannuke_fold1/
+    annotations.json   # COCO-format with boxes + RLE masks
+    images/            # 256x256 PNG tiles
+    tissue_types.json  # per-image tissue type mapping for mPQ
+  pannuke_fold2/
+    ...
+  pannuke_fold3/
+    ...
+```
 
 ## Getting Started
 
