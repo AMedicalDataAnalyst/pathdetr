@@ -1,0 +1,147 @@
+{
+  "total_images": 7901,
+  "total_annotations": 174977,
+  "cells_per_image": {
+    "mean": 22.1,
+    "median": 19,
+    "std": 18.0,
+    "min": 0,
+    "max": 248,
+    "P5": 1,
+    "P25": 11,
+    "P75": 28,
+    "P95": 53,
+    "P99": 90,
+    "P99.5": 106,
+    "empty_images": 343,
+    "empty_pct": 4.3
+  },
+  "class_distribution": {
+    "neoplastic": {
+      "count": 70017,
+      "pct": 40.0
+    },
+    "inflammatory": {
+      "count": 30238,
+      "pct": 17.3
+    },
+    "epithelial": {
+      "count": 23732,
+      "pct": 13.6
+    },
+    "connective": {
+      "count": 48180,
+      "pct": 27.5
+    },
+    "dead": {
+      "count": 2810,
+      "pct": 1.6
+    }
+  },
+  "cell_size_pixels": {
+    "bbox_side_mean": 20.3,
+    "bbox_side_median": 19.4,
+    "bbox_area_mean": 495.0,
+    "bbox_area_median": 378.0,
+    "pct_of_tile_mean": 7.9,
+    "pct_of_tile_median": 7.6
+  },
+  "tissue_distribution": {
+    "Adrenal_gland": {
+      "count": 437,
+      "pct": 5.5
+    },
+    "Bile-duct": {
+      "count": 420,
+      "pct": 5.3
+    },
+    "Bladder": {
+      "count": 146,
+      "pct": 1.8
+    },
+    "Breast": {
+      "count": 2351,
+      "pct": 29.8
+    },
+    "Cervix": {
+      "count": 293,
+      "pct": 3.7
+    },
+    "Colon": {
+      "count": 1440,
+      "pct": 18.2
+    },
+    "Esophagus": {
+      "count": 424,
+      "pct": 5.4
+    },
+    "HeadNeck": {
+      "count": 384,
+      "pct": 4.9
+    },
+    "Kidney": {
+      "count": 134,
+      "pct": 1.7
+    },
+    "Liver": {
+      "count": 224,
+      "pct": 2.8
+    },
+    "Lung": {
+      "count": 184,
+      "pct": 2.3
+    },
+    "Ovarian": {
+      "count": 146,
+      "pct": 1.8
+    },
+    "Pancreatic": {
+      "count": 195,
+      "pct": 2.5
+    },
+    "Prostate": {
+      "count": 182,
+      "pct": 2.3
+    },
+    "Skin": {
+      "count": 187,
+      "pct": 2.4
+    },
+    "Stomach": {
+      "count": 146,
+      "pct": 1.8
+    },
+    "Testis": {
+      "count": 196,
+      "pct": 2.5
+    },
+    "Thyroid": {
+      "count": 226,
+      "pct": 2.9
+    },
+    "Uterus": {
+      "count": 186,
+      "pct": 2.4
+    }
+  },
+  "per_fold": {
+    "fold1": {
+      "images": 2656,
+      "annotations": 55569,
+      "cells_per_image_mean": 20.9,
+      "cells_per_image_median": 18
+    },
+    "fold2": {
+      "images": 2523,
+      "annotations": 52754,
+      "cells_per_image_mean": 20.9,
+      "cells_per_image_median": 18
+    },
+    "fold3": {
+      "images": 2722,
+      "annotations": 66654,
+      "cells_per_image_mean": 24.5,
+      "cells_per_image_median": 20
+    }
+  }
+}
