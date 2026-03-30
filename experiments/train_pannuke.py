@@ -9,7 +9,7 @@ Config derived from factorial experiment results:
   GIoU box loss, BCE+Dice mask loss
   200 epochs, batch_size=64, validate every 10 epochs + at {1, 5}
   lr_fpn=5e-4, lr_decoder=1e-3, cosine LR with 10-epoch warmup
-  clip_grad_norm=1.0, EMA decay=0.998, num_queries=300
+  clip_grad_norm=1.0, EMA decay=0.998, num_queries=100
 
 Usage (3-fold CV — recommended):
   python -m experiments.train_pannuke --train_folds 1 2 --test_fold 3
@@ -79,7 +79,7 @@ _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _BASE_LR_FPN = 5e-4
 _BASE_LR_DECODER = 1e-3
 _EMA_DECAY = 0.998
-_NUM_QUERIES = 300
+_NUM_QUERIES = 100
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +269,15 @@ def _prediction_stats(outputs: dict) -> dict[str, float]:
 def _outputs_to_predictions(
     outputs: dict, score_threshold: float = 0.0,
     include_masks: bool = False,
+    per_class_thresholds: Optional[dict[int, float]] = None,
 ) -> list[dict]:
+    """Extract predictions from model outputs.
+
+    Args:
+        per_class_thresholds: If provided, maps class_id -> threshold.
+            Overrides score_threshold for classes present in the dict.
+            Classes not in the dict fall back to score_threshold.
+    """
     has_masks = include_masks and "pred_masks" in outputs
     preds = []
     for b in range(outputs["pred_logits"].shape[0]):
@@ -287,8 +295,18 @@ def _outputs_to_predictions(
         else:
             binary_masks = None
 
-        if score_threshold > 0.0:
+        if per_class_thresholds is not None:
+            # Per-class filtering: each query uses the threshold for its predicted class
+            thresholds = torch.tensor(
+                [per_class_thresholds.get(l.item(), score_threshold) for l in lb],
+                device=sc.device)
+            keep = sc >= thresholds
+        elif score_threshold > 0.0:
             keep = sc >= score_threshold
+        else:
+            keep = None
+
+        if keep is not None:
             sc, lb, boxes = sc[keep], lb[keep], boxes[keep]
             if binary_masks is not None:
                 binary_masks = binary_masks[keep]
@@ -372,6 +390,7 @@ def full_evaluate(
     device: torch.device,
     score_threshold: float = 0.0,
     tissue_ids: Optional[list[int]] = None,
+    per_class_thresholds: Optional[dict[int, float]] = None,
 ) -> dict[str, Any]:
     """Comprehensive evaluation with all metrics.
 
@@ -453,7 +472,8 @@ def full_evaluate(
         # Filtered preds with masks for PQ, F1d, segmentation metrics
         has_masks = "pred_masks" in outputs
         preds_filt = _outputs_to_predictions(
-            outputs, score_threshold=score_threshold, include_masks=has_masks)
+            outputs, score_threshold=score_threshold, include_masks=has_masks,
+            per_class_thresholds=per_class_thresholds)
 
         det_metrics_filt.update(preds_filt, targets)
         pq_metric.update(preds_filt, targets)
@@ -740,6 +760,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--score_threshold", type=float, default=0.3,
                         help="Min score for PQ/F1d predictions (default: 0.3)")
+    parser.add_argument("--per_class_thresholds", type=float, nargs=5, default=None,
+                        metavar=("NEO", "INFL", "EPI", "CONN", "DEAD"),
+                        help="Per-class score thresholds (5 floats, order: neo infl epi conn dead). "
+                             "Overrides --score_threshold. Use calibrate_thresholds.py to find optimal values.")
     parser.add_argument("--skip_post_training", action="store_true")
     parser.add_argument("--mask_loss_resolution", type=int, default=128,
                         help="Resolution for mask loss computation (default: 128)")
@@ -846,6 +870,12 @@ def main() -> None:
     _apply_lr_scaling(args)
     seed_everything(args.seed, deterministic=False)
     t0 = time.time()
+
+    # Build per-class threshold dict from CLI
+    _per_class_thresh: Optional[dict[int, float]] = None
+    if args.per_class_thresholds is not None:
+        _per_class_thresh = {i: t for i, t in enumerate(args.per_class_thresholds)}
+        print(f"Per-class thresholds: {dict(zip(CANONICAL_CLASSES, args.per_class_thresholds))}")
 
     out_dir = Path(args.out_dir)
     n_epochs = args.epochs
@@ -1223,7 +1253,8 @@ def main() -> None:
 
             val_results = full_evaluate(
                 model, engine.val_loader, criterion, torch.device(_DEVICE),
-                score_threshold=args.score_threshold)
+                score_threshold=args.score_threshold,
+                per_class_thresholds=_per_class_thresh)
 
             # Serialise: separate scalars from non-scalar
             val_rec: dict[str, Any] = {"epoch": epoch}
@@ -1301,7 +1332,8 @@ def main() -> None:
     # --- Final checkpoint ---
     final_val = full_evaluate(
         model, engine.val_loader, criterion, torch.device(_DEVICE),
-        score_threshold=args.score_threshold)
+        score_threshold=args.score_threshold,
+        per_class_thresholds=_per_class_thresh)
     _save_checkpoint(
         ckpt_dir / "final.pt",
         model, engine.ema, engine.optimizer,
@@ -1347,7 +1379,8 @@ def main() -> None:
         test_results = full_evaluate(
             model, test_loader, criterion, torch.device(_DEVICE),
             score_threshold=args.score_threshold,
-            tissue_ids=test_tissue_ids)
+            tissue_ids=test_tissue_ids,
+            per_class_thresholds=_per_class_thresh)
 
         # Save test results
         serialisable = {
